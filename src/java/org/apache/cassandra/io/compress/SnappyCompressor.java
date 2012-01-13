@@ -21,34 +21,30 @@ package org.apache.cassandra.io.compress;
 import java.io.IOException;
 import java.util.Map;
 
-import org.xerial.snappy.Snappy;
-
 public class SnappyCompressor implements ICompressor
 {
     public static final SnappyCompressor instance = new SnappyCompressor();
 
     public static SnappyCompressor create(Map<String, String> compressionOptions)
     {
-        // this would throw java.lang.NoClassDefFoundError if Snappy class
-        // wasn't found at runtime which should be processed by calling method
-        Snappy.getNativeLibraryVersion();
-
         // no specific options supported so far
         return instance;
     }
 
     public int initialCompressedBufferLength(int chunkLength)
     {
-        return Snappy.maxCompressedLength(chunkLength);
+        return chunkLength;
     }
 
     public int compress(byte[] input, int inputOffset, int inputLength, ICompressor.WrappedArray output, int outputOffset) throws IOException
     {
-        return Snappy.rawCompress(input, inputOffset, inputLength, output.buffer, outputOffset);
+        System.arraycopy(input, inputOffset, output.buffer, outputOffset, inputLength);
+        return inputLength;
     }
 
     public int uncompress(byte[] input, int inputOffset, int inputLength, byte[] output, int outputOffset) throws IOException
     {
-        return Snappy.rawUncompress(input, inputOffset, inputLength, output, outputOffset);
+        System.arraycopy(input, inputOffset, output, outputOffset, inputLength);
+        return inputLength;
     }
 }
