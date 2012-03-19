@@ -6,9 +6,9 @@
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * 
+ *
  *   http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
@@ -29,9 +29,14 @@ import java.util.concurrent.*;
 import com.google.common.base.Function;
 import com.google.common.collect.Collections2;
 
+import org.apache.cassandra.cache.KeyCacheKey;
 import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.index.keys.KeysIndex;
+import org.apache.cassandra.dht.LocalPartitioner;
 import org.apache.cassandra.io.compress.CompressedRandomAccessReader;
+import org.apache.cassandra.service.CacheService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -82,7 +87,7 @@ public class SSTableReader extends SSTable
     private IndexSummary indexSummary;
     private Filter bf;
 
-    private InstrumentingCache<Pair<Descriptor, DecoratedKey>, Long> keyCache;
+    private InstrumentingCache<KeyCacheKey, Long> keyCache;
 
     private BloomFilterTracker bloomFilterTracker = new BloomFilterTracker();
 
@@ -109,14 +114,30 @@ public class SSTableReader extends SSTable
         return count;
     }
 
-    public static SSTableReader open(Descriptor desc) throws IOException
+    public static SSTableReader open(Descriptor descriptor) throws IOException
     {
-        return open(desc, Schema.instance.getCFMetaData(desc.ksname, desc.cfname));
+        CFMetaData metadata;
+        if (descriptor.cfname.contains("."))
+        {
+            int i = descriptor.cfname.indexOf(".");
+            String parentName = descriptor.cfname.substring(0, i);
+            CFMetaData parent = Schema.instance.getCFMetaData(descriptor.ksname, parentName);
+            ColumnDefinition def = parent.getColumnDefinitionForIndex(descriptor.cfname.substring(i + 1));
+            metadata = CFMetaData.newIndexMetadata(parent, def, KeysIndex.indexComparator());
+        }
+        else
+        {
+            metadata = Schema.instance.getCFMetaData(descriptor.ksname, descriptor.cfname);
+        }
+        return open(descriptor, metadata);
     }
 
     public static SSTableReader open(Descriptor desc, CFMetaData metadata) throws IOException
     {
-        return open(desc, componentsFor(desc), metadata, StorageService.getPartitioner());
+        IPartitioner p = desc.cfname.contains(".")
+                       ? new LocalPartitioner(metadata.getKeyValidator())
+                       : StorageService.getPartitioner();
+        return open(desc, componentsFor(desc), metadata, p);
     }
 
     public static SSTableReader open(Descriptor descriptor, Set<Component> components, CFMetaData metadata, IPartitioner partitioner) throws IOException
@@ -283,7 +304,7 @@ public class SSTableReader extends SSTable
     {
         if (tracker != null)
         {
-            keyCache = tracker.getKeyCache();
+            keyCache = CacheService.instance.keyCache;
             deletingTask.setTracker(tracker);
         }
     }
@@ -321,6 +342,7 @@ public class SSTableReader extends SSTable
     private void load(boolean recreatebloom, Set<DecoratedKey> keysToLoadInCache) throws IOException
     {
         boolean cacheLoading = keyCache != null && !keysToLoadInCache.isEmpty();
+
         SegmentedFile.Builder ibuilder = SegmentedFile.getBuilder(DatabaseDescriptor.getIndexAccessMode());
         SegmentedFile.Builder dbuilder = compression
                                           ? SegmentedFile.getCompressedBuilder()
@@ -331,15 +353,15 @@ public class SSTableReader extends SSTable
         DecoratedKey left = null, right = null;
         try
         {
-            if (keyCache != null && keyCache.getCapacity() - keyCache.size() < keysToLoadInCache.size())
-                keyCache.updateCapacity(keyCache.size() + keysToLoadInCache.size());
-
             long indexSize = input.length();
-            long estimatedKeys = SSTable.estimateRowsFromIndex(input);
+            long histogramCount = sstableMetadata.estimatedRowSize.count();
+            long estimatedKeys = histogramCount > 0 && !sstableMetadata.estimatedRowSize.isOverflowed()
+                               ? histogramCount
+                               : SSTable.estimateRowsFromIndex(input); // statistics is supposed to be optional
             indexSummary = new IndexSummary(estimatedKeys);
             if (recreatebloom)
-                // estimate key count based on index length
                 bf = LegacyBloomFilter.getFilter(estimatedKeys, 15);
+
             while (true)
             {
                 long indexPosition = input.getFilePointer();
@@ -367,6 +389,7 @@ public class SSTableReader extends SSTable
                         bf.add(decoratedKey.key);
                     if (shouldAddEntry)
                         indexSummary.addEntry(decoratedKey, indexPosition);
+                    // if key cache could be used and we have key already pre-loaded
                     if (cacheLoading && keysToLoadInCache.contains(decoratedKey))
                         cacheKey(decoratedKey, dataPosition);
                 }
@@ -390,22 +413,22 @@ public class SSTableReader extends SSTable
     }
 
     /** get the position in the index file to start scanning to find the given key (at most indexInterval keys away) */
-    private IndexSummary.KeyPosition getIndexScanPosition(RowPosition key)
+    private long getIndexScanPosition(RowPosition key)
     {
-        assert indexSummary.getIndexPositions() != null && indexSummary.getIndexPositions().size() > 0;
-        int index = Collections.binarySearch(indexSummary.getIndexPositions(), new IndexSummary.KeyPosition(key, -1));
+        assert indexSummary.getKeys() != null && indexSummary.getKeys().size() > 0;
+        int index = Collections.binarySearch(indexSummary.getKeys(), key);
         if (index < 0)
         {
             // binary search gives us the first index _greater_ than the key searched for,
             // i.e., its insertion position
             int greaterThan = (index + 1) * -1;
             if (greaterThan == 0)
-                return null;
-            return indexSummary.getIndexPositions().get(greaterThan - 1);
+                return -1;
+            return indexSummary.getPosition(greaterThan - 1);
         }
         else
         {
-            return indexSummary.getIndexPositions().get(index);
+            return indexSummary.getPosition(index);
         }
     }
 
@@ -447,9 +470,9 @@ public class SSTableReader extends SSTable
      */
     public long estimatedKeys()
     {
-        return indexSummary.getIndexPositions().size() * DatabaseDescriptor.getIndexInterval();
+        return indexSummary.getKeys().size() * DatabaseDescriptor.getIndexInterval();
     }
-    
+
     /**
      * @param ranges
      * @return An estimate of the number of keys for given ranges in this SSTable.
@@ -457,7 +480,7 @@ public class SSTableReader extends SSTable
     public long estimatedKeysForRanges(Collection<Range<Token>> ranges)
     {
         long sampleKeyCount = 0;
-        List<Pair<Integer, Integer>> sampleIndexes = getSampleIndexesForRanges(indexSummary.getIndexPositions(), ranges);
+        List<Pair<Integer, Integer>> sampleIndexes = getSampleIndexesForRanges(indexSummary.getKeys(), ranges);
         for (Pair<Integer, Integer> sampleIndexRange : sampleIndexes)
             sampleKeyCount += (sampleIndexRange.right - sampleIndexRange.left + 1);
         return Math.max(1, sampleKeyCount * DatabaseDescriptor.getIndexInterval());
@@ -466,32 +489,24 @@ public class SSTableReader extends SSTable
     /**
      * @return Approximately 1/INDEX_INTERVALth of the keys in this SSTable.
      */
-    public Collection<DecoratedKey> getKeySamples()
+    public Collection<DecoratedKey<?>> getKeySamples()
     {
-        return Collections2.transform(indexSummary.getIndexPositions(),
-                                      new Function<IndexSummary.KeyPosition, DecoratedKey>(){
-                                          public DecoratedKey apply(IndexSummary.KeyPosition kp)
-                                          {
-                                              // the index should only contain valid row key, we only allow RowPosition in KeyPosition for search purposes
-                                              assert kp.key instanceof DecoratedKey;
-                                              return (DecoratedKey)kp.key;
-                                          }
-                                      });
+        return indexSummary.getKeys();
     }
 
-    private static List<Pair<Integer,Integer>> getSampleIndexesForRanges(List<IndexSummary.KeyPosition> samples, Collection<Range<Token>> ranges)
+    private static List<Pair<Integer,Integer>> getSampleIndexesForRanges(List<DecoratedKey<?>> samples, Collection<Range<Token>> ranges)
     {
         // use the index to determine a minimal section for each range
         List<Pair<Integer,Integer>> positions = new ArrayList<Pair<Integer,Integer>>();
         if (samples.isEmpty())
             return positions;
 
-        for (AbstractBounds<Token> range : AbstractBounds.<Token>normalize(ranges))
+        for (Range<Token> range : Range.<Token>normalize(ranges))
         {
             RowPosition leftPosition = range.left.maxKeyBound();
             RowPosition rightPosition = range.left.maxKeyBound();
 
-            int left = Collections.binarySearch(samples, new IndexSummary.KeyPosition(leftPosition, -1));
+            int left = Collections.binarySearch(samples, leftPosition);
             if (left < 0)
                 left = (left + 1) * -1;
             else
@@ -503,7 +518,7 @@ public class SSTableReader extends SSTable
 
             int right = Range.isWrapAround(range.left, range.right)
                       ? samples.size() - 1
-                      : Collections.binarySearch(samples, new IndexSummary.KeyPosition(rightPosition, -1));
+                      : Collections.binarySearch(samples, rightPosition);
             if (right < 0)
             {
                 // range are end inclusive so we use the previous index from what binarySearch give us
@@ -523,20 +538,20 @@ public class SSTableReader extends SSTable
         return positions;
     }
 
-    public Iterable<DecoratedKey> getKeySamples(final Range<Token> range)
+    public Iterable<DecoratedKey<?>> getKeySamples(final Range<Token> range)
     {
-        final List<IndexSummary.KeyPosition> samples = indexSummary.getIndexPositions();
+        final List<DecoratedKey<?>> samples = indexSummary.getKeys();
 
         final List<Pair<Integer, Integer>> indexRanges = getSampleIndexesForRanges(samples, Collections.singletonList(range));
 
         if (indexRanges.isEmpty())
             return Collections.emptyList();
 
-        return new Iterable<DecoratedKey>()
+        return new Iterable<DecoratedKey<?>>()
         {
-            public Iterator<DecoratedKey> iterator()
+            public Iterator<DecoratedKey<?>> iterator()
             {
-                return new Iterator<DecoratedKey>()
+                return new Iterator<DecoratedKey<?>>()
                 {
                     private Iterator<Pair<Integer, Integer>> rangeIter = indexRanges.iterator();
                     private Pair<Integer, Integer> current;
@@ -560,10 +575,10 @@ public class SSTableReader extends SSTable
 
                     public DecoratedKey next()
                     {
-                        RowPosition k = samples.get(idx++).key;
+                        RowPosition k = samples.get(idx++);
                         // the index should only contain valid row key, we only allow RowPosition in KeyPosition for search purposes
                         assert k instanceof DecoratedKey;
-                        return (DecoratedKey)k;
+                        return (DecoratedKey<?>)k;
                     }
 
                     public void remove()
@@ -583,7 +598,7 @@ public class SSTableReader extends SSTable
     {
         // use the index to determine a minimal section for each range
         List<Pair<Long,Long>> positions = new ArrayList<Pair<Long,Long>>();
-        for (AbstractBounds<Token> range : AbstractBounds.normalize(ranges))
+        for (Range<Token> range : Range.normalize(ranges))
         {
             AbstractBounds<RowPosition> keyRange = range.toRowBounds();
             long left = getPosition(keyRange.left, Operator.GT);
@@ -604,17 +619,24 @@ public class SSTableReader extends SSTable
 
     public void cacheKey(DecoratedKey key, Long info)
     {
+        CFMetaData.Caching caching = metadata.getCaching();
+
+        if (keyCache == null
+                || caching == CFMetaData.Caching.NONE
+                || caching == CFMetaData.Caching.ROWS_ONLY
+                || keyCache.getCapacity() == 0)
+            return;
+
         // avoid keeping a permanent reference to the original key buffer
-        DecoratedKey copiedKey = new DecoratedKey(key.token, ByteBufferUtil.clone(key.key));
-        keyCache.put(new Pair<Descriptor, DecoratedKey>(descriptor, copiedKey), info);
+        keyCache.put(new KeyCacheKey(descriptor, ByteBufferUtil.clone(key.key)), info);
     }
 
     public Long getCachedPosition(DecoratedKey key, boolean updateStats)
     {
-        return getCachedPosition(new Pair<Descriptor, DecoratedKey>(descriptor, key), updateStats);
+        return getCachedPosition(new KeyCacheKey(descriptor, key.key), updateStats);
     }
 
-    private Long getCachedPosition(Pair<Descriptor, DecoratedKey> unifiedKey, boolean updateStats)
+    private Long getCachedPosition(KeyCacheKey unifiedKey, boolean updateStats)
     {
         if (keyCache != null && keyCache.getCapacity() > 0)
             return updateStats ? keyCache.get(unifiedKey) : keyCache.getInternal(unifiedKey);
@@ -641,15 +663,14 @@ public class SSTableReader extends SSTable
         if ((op == Operator.EQ || op == Operator.GE) && (key instanceof DecoratedKey))
         {
             DecoratedKey decoratedKey = (DecoratedKey)key;
-            Pair<Descriptor, DecoratedKey> unifiedKey = new Pair<Descriptor, DecoratedKey>(descriptor, decoratedKey);
-            Long cachedPosition = getCachedPosition(unifiedKey, true);
+            Long cachedPosition = getCachedPosition(new KeyCacheKey(descriptor, decoratedKey.key), true);
             if (cachedPosition != null)
                 return cachedPosition;
         }
 
         // next, see if the sampled index says it's impossible for the key to be present
-        IndexSummary.KeyPosition sampledPosition = getIndexScanPosition(key);
-        if (sampledPosition == null)
+        long sampledPosition = getIndexScanPosition(key);
+        if (sampledPosition == -1)
         {
             if (op == Operator.EQ)
                 bloomFilterTracker.addFalsePositive();
@@ -658,7 +679,7 @@ public class SSTableReader extends SSTable
         }
 
         // scan the on-disk index, starting at the nearest sampled position
-        Iterator<FileDataInput> segments = ifile.iterator(sampledPosition.indexPosition, INDEX_FILE_BUFFER_BYTES);
+        Iterator<FileDataInput> segments = ifile.iterator(sampledPosition, INDEX_FILE_BUFFER_BYTES);
         while (segments.hasNext())
         {
             FileDataInput input = segments.next();
@@ -909,7 +930,7 @@ public class SSTableReader extends SSTable
         return bloomFilterTracker.getRecentTruePositiveCount();
     }
 
-    public InstrumentingCache<Pair<Descriptor,DecoratedKey>, Long> getKeyCache()
+    public InstrumentingCache<KeyCacheKey, Long> getKeyCache()
     {
         return keyCache;
     }

@@ -20,15 +20,11 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.charset.CharacterCodingException;
 import java.nio.ByteBuffer;
-import java.util.Iterator;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 import org.apache.cassandra.config.ConfigurationException;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,17 +52,17 @@ public class DynamicCompositeType extends AbstractCompositeType
 {
     private static final Logger logger = LoggerFactory.getLogger(DynamicCompositeType.class);
 
-    private final Map<Byte, AbstractType> aliases;
+    private final Map<Byte, AbstractType<?>> aliases;
 
     // interning instances
-    private static final Map<Map<Byte, AbstractType>, DynamicCompositeType> instances = new HashMap<Map<Byte, AbstractType>, DynamicCompositeType>();
+    private static final Map<Map<Byte, AbstractType<?>>, DynamicCompositeType> instances = new HashMap<Map<Byte, AbstractType<?>>, DynamicCompositeType>();
 
     public static synchronized DynamicCompositeType getInstance(TypeParser parser) throws ConfigurationException
     {
         return getInstance(parser.getAliasParameters());
     }
 
-    public static synchronized DynamicCompositeType getInstance(Map<Byte, AbstractType> aliases)
+    public static synchronized DynamicCompositeType getInstance(Map<Byte, AbstractType<?>> aliases)
     {
         DynamicCompositeType dct = instances.get(aliases);
         if (dct == null)
@@ -77,12 +73,12 @@ public class DynamicCompositeType extends AbstractCompositeType
         return dct;
     }
 
-    private DynamicCompositeType(Map<Byte, AbstractType> aliases)
+    private DynamicCompositeType(Map<Byte, AbstractType<?>> aliases)
     {
         this.aliases = aliases;
     }
 
-    private AbstractType getComparator(ByteBuffer bb)
+    private AbstractType<?> getComparator(ByteBuffer bb)
     {
         try
         {
@@ -107,26 +103,40 @@ public class DynamicCompositeType extends AbstractCompositeType
         }
     }
 
-    protected AbstractType getNextComparator(int i, ByteBuffer bb)
+    protected AbstractType<?> getNextComparator(int i, ByteBuffer bb)
     {
         return getComparator(bb);
     }
 
-    protected AbstractType getNextComparator(int i, ByteBuffer bb1, ByteBuffer bb2)
+    protected AbstractType<?> getNextComparator(int i, ByteBuffer bb1, ByteBuffer bb2)
     {
-        AbstractType comp1 = getComparator(bb1);
-        AbstractType comp2 = getComparator(bb2);
+        AbstractType<?> comp1 = getComparator(bb1);
+        AbstractType<?> comp2 = getComparator(bb2);
 
-        // This rely on comparator always being singleton instances
+        // Fast test if the comparator uses singleton instances
         if (comp1 != comp2)
         {
-            logger.error("Mismatch between {} and {}", comp1, comp2);
-            throw new RuntimeException("Comparator mismatch while comparing two DynamicCompositeType colum name");
+            /*
+             * We compare component of different types by comparing the
+             * comparator class names. We start with the simple classname
+             * first because that will be faster in almost all cases, but
+             * allback on the full name if necessary
+            */
+            int cmp = comp1.getClass().getSimpleName().compareTo(comp2.getClass().getSimpleName());
+            if (cmp != 0)
+                return cmp < 0 ? FixedValueComparator.instance : ReversedType.getInstance(FixedValueComparator.instance);
+
+            cmp = comp1.getClass().getName().compareTo(comp2.getClass().getName());
+            if (cmp != 0)
+                return cmp < 0 ? FixedValueComparator.instance : ReversedType.getInstance(FixedValueComparator.instance);
+
+            // if cmp == 0, we're actually having the same type, but one that
+            // did not have a singleton instance. It's ok (though inefficient).
         }
         return comp1;
     }
 
-    protected AbstractType getAndAppendNextComparator(int i, ByteBuffer bb, StringBuilder sb)
+    protected AbstractType<?> getAndAppendNextComparator(int i, ByteBuffer bb, StringBuilder sb)
     {
         try
         {
@@ -158,9 +168,9 @@ public class DynamicCompositeType extends AbstractCompositeType
         return new DynamicParsedComparator(part);
     }
 
-    protected AbstractType validateNextComparator(int i, ByteBuffer bb) throws MarshalException
+    protected AbstractType<?> validateNextComparator(int i, ByteBuffer bb) throws MarshalException
     {
-        AbstractType comparator = null;
+        AbstractType<?> comparator = null;
         if (bb.remaining() < 2)
             throw new MarshalException("Not enough bytes to header of the comparator part of component " + i);
         int header = getShortLength(bb);
@@ -190,9 +200,36 @@ public class DynamicCompositeType extends AbstractCompositeType
             return comparator;
     }
 
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> previous)
+    {
+        if (this == previous)
+            return true;
+
+        if (!(previous instanceof DynamicCompositeType))
+            return false;
+
+        // Adding new aliases is fine (but removing is not)
+        // Note that modifying the type for an alias to a compatible type is
+        // *not* fine since this would deal correctly with mixed aliased/not
+        // aliased component.
+        DynamicCompositeType cp = (DynamicCompositeType)previous;
+        if (aliases.size() < cp.aliases.size())
+            return false;
+
+        for (Map.Entry<Byte, AbstractType<?>> entry : cp.aliases.entrySet())
+        {
+            AbstractType<?> tprev = entry.getValue();
+            AbstractType<?> tnew = aliases.get(entry.getKey());
+            if (tnew == null || tnew != tprev)
+                return false;
+        }
+        return true;
+    }
+
     private class DynamicParsedComparator implements ParsedComparator
     {
-        final AbstractType type;
+        final AbstractType<?> type;
         final boolean isAlias;
         final String comparatorName;
         final String remainingPart;
@@ -208,7 +245,7 @@ public class DynamicCompositeType extends AbstractCompositeType
 
             try
             {
-                AbstractType t = null;
+                AbstractType<?> t = null;
                 if (comparatorName.length() == 1)
                 {
                     // try for an alias
@@ -229,7 +266,7 @@ public class DynamicCompositeType extends AbstractCompositeType
             }
         }
 
-        public AbstractType getAbstractType()
+        public AbstractType<?> getAbstractType()
         {
             return type;
         }
@@ -248,7 +285,7 @@ public class DynamicCompositeType extends AbstractCompositeType
         {
             int header = 0;
             if (isAlias)
-                header = 0x8000 | ((byte)comparatorName.charAt(0));
+                header = 0x8000 | (((byte)comparatorName.charAt(0)) & 0xFF);
             else
                 header = comparatorName.length();
             putShortLength(bb, header);
@@ -262,5 +299,39 @@ public class DynamicCompositeType extends AbstractCompositeType
     public String toString()
     {
         return getClass().getName() + TypeParser.stringifyAliasesParameters(aliases);
+    }
+
+    /*
+     * A comparator that always sorts it's first argument before the second
+     * one.
+     */
+    private static class FixedValueComparator extends AbstractType<Void>
+    {
+        public static final FixedValueComparator instance = new FixedValueComparator();
+
+        public int compare(ByteBuffer v1, ByteBuffer v2)
+        {
+            return -1;
+        }
+
+        public Void compose(ByteBuffer bytes)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public ByteBuffer decompose(Void value)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public String getString(ByteBuffer bytes)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        public void validate(ByteBuffer bytes)
+        {
+            throw new UnsupportedOperationException();
+        }
     }
 }

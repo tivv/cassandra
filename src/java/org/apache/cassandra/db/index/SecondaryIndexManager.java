@@ -31,7 +31,6 @@ import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.LocalToken;
 import org.apache.cassandra.io.sstable.ReducingKeyIterator;
 import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.thrift.IndexClause;
 import org.apache.cassandra.thrift.IndexExpression;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.commons.lang.StringUtils;
@@ -94,6 +93,12 @@ public class SecondaryIndexManager
         for (ColumnDefinition cdef : baseCfs.metadata.getColumn_metadata().values())
             if (cdef.getIndexType() != null && !indexedColumnNames.contains(cdef.name))
                 addIndexedColumn(cdef);
+
+        for (ColumnFamilyStore cfs : getIndexesBackedByCfs())
+        {
+            cfs.metadata.reloadSecondaryIndexMetadata(baseCfs.metadata);
+            cfs.reload();
+        }
     }
     
     
@@ -104,7 +109,7 @@ public class SecondaryIndexManager
      * Caller must acquire and release references to the sstables used here.
      *
      * @param sstables the data to build from
-     * @param columns the list of columns to index
+     * @param columns the list of columns to index, ordered by comparator
      * @throws IOException 
      */
     public void maybeBuildSecondaryIndexes(Collection<SSTableReader> sstables, SortedSet<ByteBuffer> columns) throws IOException
@@ -140,6 +145,26 @@ public class SecondaryIndexManager
     public SortedSet<ByteBuffer> getIndexedColumns()
     {
         return indexesByColumn.keySet();
+    }
+
+    /**
+     * @return true if the indexes can handle the clause.
+     */
+    public boolean hasIndexFor(List<IndexExpression> clause)
+    {
+        if (clause == null || clause.isEmpty())
+            return false;
+
+        // It doesn't seem a clause can have multiple searchers, but since
+        // getIndexSearchersForQuery returns a list ...
+        List<SecondaryIndexSearcher> searchers = getIndexSearchersForQuery(clause);
+        if (searchers.isEmpty())
+            return false;
+
+        for (SecondaryIndexSearcher searcher : searchers)
+            if (!searcher.isIndexing(clause))
+                return false;
+        return true;
     }
 
     /**
@@ -290,6 +315,16 @@ public class SecondaryIndexManager
         return indexList;
     }
     
+    public ByteBuffer getColumnByIdxName(String idxName)
+    {        
+        for (Map.Entry<ByteBuffer, SecondaryIndex> entry : indexesByColumn.entrySet())
+        {
+            if (entry.getValue().getIndexName().equals(idxName)) 
+                return entry.getKey();
+        }
+        throw new RuntimeException("Unknown Index Name: " + idxName);
+    }
+    
     /**
      * @return all CFS from indexes which use a backing CFS internally (KEYS)
      */
@@ -308,7 +343,62 @@ public class SecondaryIndexManager
         return cfsList;
     }
         
-   
+    /**
+     * @return all indexes which do *not* use a backing CFS internally
+     */
+    public Collection<SecondaryIndex> getIndexesNotBackedByCfs()
+    {
+        // we use identity map because per row indexes use same instance
+        // across many columns
+        IdentityHashMap<SecondaryIndex, Object> indexList = new IdentityHashMap<SecondaryIndex, Object>();
+
+        for (Map.Entry<ByteBuffer, SecondaryIndex> entry : indexesByColumn.entrySet())
+        {
+            ColumnFamilyStore cfs = entry.getValue().getIndexCfs();
+            
+            if (cfs == null)
+                indexList.put(entry.getValue(), null);        
+        }
+        
+        return indexList.keySet();
+    }
+
+    /**
+     * @return all of the secondary indexes without distinction to the (non-)backed by secondary ColumnFamilyStore.
+     */
+    public Collection<SecondaryIndex> getIndexes()
+    {
+        // we use identity map because per row indexes use same instance across many columns
+        IdentityHashMap<SecondaryIndex, Object> indexList = new IdentityHashMap<SecondaryIndex, Object>();
+
+        for (Map.Entry<ByteBuffer, SecondaryIndex> entry : indexesByColumn.entrySet())
+            indexList.put(entry.getValue(), null);
+
+        return indexList.keySet();
+    }
+
+    /**
+     * @return total current ram size of all indexes
+     */
+    public long getTotalLiveSize()
+    {
+        long total = 0;
+        
+        // we use identity map because per row indexes use same instance
+        // across many columns
+        IdentityHashMap<SecondaryIndex, Object> indexList = new IdentityHashMap<SecondaryIndex, Object>();
+
+        for (Map.Entry<ByteBuffer, SecondaryIndex> entry : indexesByColumn.entrySet())
+        {
+            SecondaryIndex index = entry.getValue();
+            
+            if (indexList.put(index, index) == null)
+                total += index.getLiveSize();
+        }
+        
+        return total;
+    }
+    
     /**
      * Removes obsolete index entries and creates new ones for the given row key
      * and mutated columns.
@@ -444,9 +534,9 @@ public class SecondaryIndexManager
     /**
      * Get a list of IndexSearchers from the union of expression index types
      * @param clause the query clause
-     * @return the searchers to needed to query the index
+     * @return the searchers needed to query the index
      */
-    private List<SecondaryIndexSearcher> getIndexSearchersForQuery(IndexClause clause)
+    private List<SecondaryIndexSearcher> getIndexSearchersForQuery(List<IndexExpression> clause)
     {
         List<SecondaryIndexSearcher> indexSearchers = new ArrayList<SecondaryIndexSearcher>();
         
@@ -454,7 +544,7 @@ public class SecondaryIndexManager
  
         
         //Group columns by type
-        for (IndexExpression ix : clause.expressions)
+        for (IndexExpression ix : clause)
         {
             SecondaryIndex index = getIndexForColumn(ix.column_name);
             
@@ -490,7 +580,7 @@ public class SecondaryIndexManager
      * @param dataFilter the column range to restrict to
      * @return found indexed rows
      */
-    public List<Row> search(IndexClause clause, AbstractBounds<RowPosition> range, IFilter dataFilter)
+    public List<Row> search(List<IndexExpression> clause, AbstractBounds<RowPosition> range, int maxResults, IFilter dataFilter, boolean maxIsColumns)
     {
         List<SecondaryIndexSearcher> indexSearchers = getIndexSearchersForQuery(clause);
                
@@ -502,6 +592,18 @@ public class SecondaryIndexManager
             throw new RuntimeException("Unable to search across multiple secondary index types");
         
         
-        return indexSearchers.get(0).search(clause, range, dataFilter);
+        return indexSearchers.get(0).search(clause, range, maxResults, dataFilter, maxIsColumns);
+    }
+
+    public void setIndexBuilt(Collection<ByteBuffer> indexes)
+    {
+        for (ByteBuffer colName : indexes)
+            indexesByColumn.get(colName).setIndexBuilt(colName);
+    }
+    
+    public void setIndexRemoved(Collection<ByteBuffer> indexes)
+    {
+        for (ByteBuffer colName : indexes)
+            indexesByColumn.get(colName).setIndexBuilt(colName);
     }
 }

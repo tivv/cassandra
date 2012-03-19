@@ -63,7 +63,7 @@ public class KeysIndex extends PerColumnSecondaryIndex
                                                              indexedCfMetadata);
     }
 
-    public static AbstractType indexComparator()
+    public static AbstractType<?> indexComparator()
     {
         IPartitioner rowPartitioner = StorageService.getPartitioner();
         return (rowPartitioner instanceof OrderPreservingPartitioner || rowPartitioner instanceof ByteOrderedPartitioner)
@@ -133,6 +133,11 @@ public class KeysIndex extends PerColumnSecondaryIndex
         indexCfs.invalidate();
     }
 
+    public void truncate(long truncatedAt)
+    {
+        indexCfs.discardSSTables(truncatedAt);
+    }
+
     public ColumnFamilyStore getIndexCfs()
     {
        return indexCfs;
@@ -151,5 +156,10 @@ public class KeysIndex extends PerColumnSecondaryIndex
     public void validateOptions() throws ConfigurationException
     {
         // no options used
+    }
+
+    public long getLiveSize()
+    {
+        return indexCfs.getMemtableDataSize();
     }
 }

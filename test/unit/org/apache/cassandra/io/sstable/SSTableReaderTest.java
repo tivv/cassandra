@@ -24,14 +24,17 @@ package org.apache.cassandra.io.sstable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.concurrent.ExecutionException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
 
 import org.junit.Test;
 
 import org.apache.cassandra.CleanupHelper;
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
@@ -40,20 +43,16 @@ import org.apache.cassandra.db.filter.QueryPath;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.MmappedSegmentedFile;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.IndexClause;
 import org.apache.cassandra.thrift.IndexExpression;
 import org.apache.cassandra.thrift.IndexOperator;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CLibrary;
 import org.apache.cassandra.utils.Pair;
-
-import org.apache.cassandra.Util;
-
-import static org.junit.Assert.assertEquals;
 
 public class SSTableReaderTest extends CleanupHelper
 {
@@ -157,9 +156,14 @@ public class SSTableReaderTest extends CleanupHelper
         }
         store.forceBlockingFlush();
 
-        store.clearUnsafe();
-        store.loadNewSSTables();
+        clearAndLoad(store);
         assert store.getMaxRowSize() != 0;
+    }
+
+    private void clearAndLoad(ColumnFamilyStore cfs) throws IOException
+    {
+        cfs.clearUnsafe();
+        cfs.loadNewSSTables();
     }
 
     @Test
@@ -167,7 +171,7 @@ public class SSTableReaderTest extends CleanupHelper
     {
         Table table = Table.open("Keyspace1");
         ColumnFamilyStore store = table.getColumnFamilyStore("Standard2");
-        store.getKeyCache().setCapacity(100);
+        CacheService.instance.keyCache.setCapacity(100);
 
         // insert data and compact to a single sstable
         CompactionManager.instance.disableAutoCompaction();
@@ -221,19 +225,16 @@ public class SSTableReaderTest extends CleanupHelper
         File rootDir = new File(root + File.separator + "hb" + File.separator + "Keyspace1");
         assert rootDir.isDirectory();
 
-        String[] destDirs = DatabaseDescriptor.getAllDataFileLocationsForTable("Keyspace1");
-        assert destDirs != null;
-        assert destDirs.length > 0;
+        File destDir = Directories.create("Keyspace1", "Indexed1").getDirectoryForNewSSTables(0);
+        assert destDir != null;
 
-        FileUtils.createDirectory(destDirs[0]);
+        FileUtils.createDirectory(destDir);
         for (File srcFile : rootDir.listFiles())
         {
             if (!srcFile.getName().startsWith("Indexed1"))
                 continue;
-            File destFile = new File(destDirs[0] + File.separator + srcFile.getName());
-            CLibrary.createHardLinkWithExec(srcFile, destFile);
-
-            destFile = new File(destDirs[0] + File.separator + srcFile.getName());
+            File destFile = new File(destDir, srcFile.getName());
+            CLibrary.createHardLink(srcFile, destFile);
 
             assert destFile.exists() : destFile.getAbsoluteFile();
         }
@@ -243,25 +244,20 @@ public class SSTableReaderTest extends CleanupHelper
         assertIndexQueryWorks(store);
     }
 
-    private void assertIndexQueryWorks(ColumnFamilyStore indexedCFS)
+    private void assertIndexQueryWorks(ColumnFamilyStore indexedCFS) throws IOException
     {
         assert "Indexed1".equals(indexedCFS.getColumnFamilyName());
 
         // make sure all sstables including 2ary indexes load from disk
-        indexedCFS.clearUnsafe();
-        for (ColumnFamilyStore indexCfs : indexedCFS.indexManager.getIndexesBackedByCfs())
-        {
-            indexCfs.clearUnsafe();
-            indexCfs.loadNewSSTables(); // v1.0.4 would fail here (see CASSANDRA-3540)
-        }
-        indexedCFS.loadNewSSTables();
+        for (ColumnFamilyStore cfs : indexedCFS.concatWithIndexes())
+            clearAndLoad(cfs);
 
         // query using index to see if sstable for secondary index opens
         IndexExpression expr = new IndexExpression(ByteBufferUtil.bytes("birthdate"), IndexOperator.EQ, ByteBufferUtil.bytes(1L));
-        IndexClause clause = new IndexClause(Arrays.asList(expr), ByteBufferUtil.EMPTY_BYTE_BUFFER, 100);
+        List<IndexExpression> clause = Arrays.asList(expr);
         IPartitioner p = StorageService.getPartitioner();
         Range<RowPosition> range = Util.range("", "");
-        List<Row> rows = indexedCFS.search(clause, range, new IdentityQueryFilter());
+        List<Row> rows = indexedCFS.search(clause, range, 100, new IdentityQueryFilter());
         assert rows.size() == 1;
     }
 

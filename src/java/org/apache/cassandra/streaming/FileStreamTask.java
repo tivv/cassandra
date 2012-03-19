@@ -94,7 +94,13 @@ public class FileStreamTask extends WrappedRunnable
             // successfully connected: stream.
             // (at this point, if we fail, it is the receiver's job to re-request)
             stream();
-            if (StreamOutSession.get(to, header.sessionId).getFiles().size() == 0)
+
+            StreamOutSession session = StreamOutSession.get(to, header.sessionId);
+            if (session == null)
+            {
+                logger.info("Found no stream out session at end of file stream task - this is expected if the receiver went down");
+            }
+            else if (session.getFiles().size() == 0)
             {
                 // we are the last of our kind, receive the final confirmation before closing
                 receiveReply();
@@ -185,7 +191,7 @@ public class FileStreamTask extends WrappedRunnable
         assert MessagingService.getBits(msheader, 3, 1) == 0 : "Stream received before stream reply";
         int version = MessagingService.getBits(msheader, 15, 8);
 
-        int totalSize = input.readInt();
+        input.readInt(); // Read total size
         String id = input.readUTF();
         Header header = Header.serializer().deserialize(input, version);
 
@@ -232,6 +238,7 @@ public class FileStreamTask extends WrappedRunnable
             try
             {
                 socket = MessagingService.instance().getConnectionPool(to).newSocket();
+                socket.setSoTimeout(DatabaseDescriptor.getStreamingSocketTimeout());
                 output = socket.getOutputStream();
                 input = new DataInputStream(socket.getInputStream());
                 break;

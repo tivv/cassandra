@@ -20,6 +20,9 @@ package org.apache.cassandra.config;
  * 
  */
 
+import org.apache.cassandra.cache.ConcurrentLinkedHashCacheProvider;
+import org.apache.cassandra.cache.IRowCacheProvider;
+
 import java.util.List;
 
 
@@ -49,6 +52,8 @@ public class Config
     public String initial_token;
     
     public Long rpc_timeout_in_ms = new Long(2000);
+
+    public Integer streaming_socket_timeout_in_ms = new Integer(0);
 
     public Integer phi_convict_threshold = 8;
     
@@ -121,6 +126,38 @@ public class Config
 
     public boolean incremental_backups = false;
     public int memtable_flush_queue_size = 4;
+
+    public int key_cache_size_in_mb = 2;
+    public int key_cache_save_period = 14400;
+    public int key_cache_keys_to_save = Integer.MAX_VALUE;
+
+    public int row_cache_size_in_mb = 0;
+    public int row_cache_save_period = 0;
+    public int row_cache_keys_to_save = Integer.MAX_VALUE;
+    public String row_cache_provider = ConcurrentLinkedHashCacheProvider.class.getSimpleName();
+
+    private static boolean loadYaml = true;
+    private static boolean outboundBindAny = false;
+
+    public static boolean getOutboundBindAny()
+    {
+        return outboundBindAny;
+    }
+
+    public static void setOutboundBindAny(boolean value)
+    {
+        outboundBindAny = value;
+    }
+
+    public static boolean getLoadYaml()
+    {
+       return loadYaml;
+    }
+
+    public static void setLoadYaml(boolean value)
+    {
+        loadYaml = value;
+    }
 
     public static enum CommitLogSync {
         periodic,

@@ -97,11 +97,6 @@ public class QueryFilter
         {
             ColumnFamily curCF = returnCF.cloneMeShallow();
 
-            protected boolean isEqual(IColumn o1, IColumn o2)
-            {
-                return o1.name().equals(o2.name());
-            }
-
             public void reduce(IColumn current)
             {
                 if (curCF.isSuper() && curCF.isEmpty())
@@ -154,8 +149,8 @@ public class QueryFilter
         // the column itself must be not gc-able (it is live, or a still relevant tombstone, or has live subcolumns), (1)
         // and if its container is deleted, the column must be changed more recently than the container tombstone (2)
         // (since otherwise, the only thing repair cares about is the container tombstone)
-        long maxChange = column.mostRecentLiveChangeAt();
-        return (!column.isMarkedForDelete() || column.getLocalDeletionTime() > gcBefore || maxChange > column.getMarkedForDeleteAt()) // (1)
+        long maxChange = column.mostRecentNonGCableChangeAt(gcBefore);
+        return (column.getLocalDeletionTime() >= gcBefore || maxChange > column.getMarkedForDeleteAt()) // (1)
                && (!container.isMarkedForDelete() || maxChange > container.getMarkedForDeleteAt()); // (2)
     }
 
@@ -185,14 +180,14 @@ public class QueryFilter
      * @return a QueryFilter object that will return columns matching the given names
      * @param key the row to slice
      * @param path path to the level to slice at (CF or SuperColumn)
-     * @param columns the column names to restrict the results to
+     * @param columns the column names to restrict the results to, sorted in comparator order
      */
     public static QueryFilter getNamesFilter(DecoratedKey<?> key, QueryPath path, SortedSet<ByteBuffer> columns)
     {
         return new QueryFilter(key, path, new NamesQueryFilter(columns));
     }
 
-    public static IFilter getFilter(SlicePredicate predicate, AbstractType comparator)
+    public static IFilter getFilter(SlicePredicate predicate, AbstractType<?> comparator)
     {
         if (predicate.column_names != null)
         {

@@ -94,13 +94,6 @@ public interface StorageServiceMBean
     public String[] getAllDataFileLocations();
 
     /**
-     * Get the list of data file locations for a given table
-     * @param table the table to get locations for.
-     * @return String array of all locations
-     */
-    public String[] getAllDataFileLocationsForTable(String table);
-
-    /**
      * Get location of the commit log
      * @return a string path
      */
@@ -118,7 +111,7 @@ public interface StorageServiceMBean
      *
      * @return mapping of ranges to end points
      */
-    public Map<Range<Token>, List<String>> getRangeToEndpointMap(String keyspace);
+    public Map<List<String>, List<String>> getRangeToEndpointMap(String keyspace);
 
     /**
      * Retrieve a map of range to rpc addresses that describe the ring topology
@@ -126,7 +119,7 @@ public interface StorageServiceMBean
      *
      * @return mapping of ranges to rpc addresses
      */
-    public Map<Range<Token>, List<String>> getRangeToRpcaddressMap(String keyspace);
+    public Map<List<String>, List<String>> getRangeToRpcaddressMap(String keyspace);
 
     /**
      * The same as {@code describeRing(String)} but converts TokenRange to the String for JMX compatibility
@@ -144,15 +137,15 @@ public interface StorageServiceMBean
      * @param keyspace the keyspace to get the pending range map for.
      * @return a map of pending ranges to endpoints
      */
-    public Map<Range<Token>, List<String>> getPendingRangeToEndpointMap(String keyspace);
+    public Map<List<String>, List<String>> getPendingRangeToEndpointMap(String keyspace);
 
     /**
      * Retrieve a map of tokens to endpoints, including the bootstrapping
      * ones.
      *
-     * @return a map of tokens to endpoints
+     * @return a map of tokens to endpoints in ascending order
      */
-    public Map<Token, String> getTokenToEndpointMap();
+    public Map<String, String> getTokenToEndpointMap();
 
     /**
      * Numeric load value.
@@ -300,17 +293,11 @@ public interface StorageServiceMBean
      */
     public void truncate(String keyspace, String columnFamily) throws UnavailableException, TimeoutException, IOException;
 
-    /** force hint delivery to an endpoint **/
-    public void deliverHints(String host) throws UnknownHostException;
-
-    /** save row and key caches */
-    public void saveCaches() throws ExecutionException, InterruptedException;
-
     /**
      * given a list of tokens (representing the nodes in the cluster), returns
      *   a mapping from "token -> %age of cluster owned by that token"
      */
-    public Map<Token, Float> getOwnership();
+    public Map<String, Float> getOwnership();
 
     public List<String> getKeyspaces();
 
@@ -343,20 +330,29 @@ public interface StorageServiceMBean
     // to determine if thrift is running
     public boolean isRPCServerRunning();
 
-    public void invalidateKeyCaches(String ks, String... cfs) throws IOException;
-    public void invalidateRowCaches(String ks, String... cfs) throws IOException;
-
     // allows a node that have been started without joining the ring to join it
     public void joinRing() throws IOException, org.apache.cassandra.config.ConfigurationException;
     public boolean isJoined();
 
     public int getExceptionCount();
+    
+    public void setStreamThroughputMbPerSec(int value);
+    public int getStreamThroughputMbPerSec();
 
     public int getCompactionThroughputMbPerSec();
     public void setCompactionThroughputMbPerSec(int value);
 
     public boolean isIncrementalBackupsEnabled();
     public void setIncrementalBackupsEnabled(boolean value);
+
+    /**
+     * Initiate a process of streaming data for which we are responsible from other nodes. It is similar to bootstrap
+     * except meant to be used on a node which is already in the cluster (typically containing no data) as an
+     * alternative to running repair.
+     *
+     * @param sourceDc Name of DC from which to select sources for streaming or null to pick any node
+     */
+    public void rebuild(String sourceDc);
 
     public void bulkLoad(String directory);
 
@@ -369,4 +365,17 @@ public interface StorageServiceMBean
      * @param cfName The ColumnFamily name where SSTables belong
      */
     public void loadNewSSTables(String ksName, String cfName);
+    
+    /**
+     * Return a List of Tokens representing a sample of keys
+     * across all ColumnFamilyStores
+     * 
+     * @return set of Tokens as Strings
+     */
+    public List<String> getRangeKeySample();
+
+    /**
+     * rebuild the specified indexes
+     */
+    public void rebuildSecondaryIndex(String ksName, String cfName, String... idxNames);
 }

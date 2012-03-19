@@ -27,12 +27,13 @@ import java.io.IOException;
 import java.util.*;
 
 import com.google.common.collect.Iterables;
+import com.google.common.primitives.Ints;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.RowPosition;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.SSTable;
@@ -59,7 +60,7 @@ public class LeveledManifest
 
     private final ColumnFamilyStore cfs;
     private final List<SSTableReader>[] generations;
-    private final DecoratedKey[] lastCompactedKeys;
+    private final RowPosition[] lastCompactedKeys;
     private final int maxSSTableSizeInMB;
     private int levelCount;
 
@@ -71,11 +72,11 @@ public class LeveledManifest
         // allocate enough generations for a PB of data
         int n = (int) Math.log10(1000 * 1000 * 1000 / maxSSTableSizeInMB);
         generations = new List[n];
-        lastCompactedKeys = new DecoratedKey[n];
+        lastCompactedKeys = new RowPosition[n];
         for (int i = 0; i < generations.length; i++)
         {
             generations[i] = new ArrayList<SSTableReader>();
-            lastCompactedKeys[i] = new DecoratedKey(cfs.partitioner.getMinimumToken(), null);
+            lastCompactedKeys[i] = cfs.partitioner.getMinimumToken().minKeyBound();
         }
     }
 
@@ -203,11 +204,14 @@ public class LeveledManifest
         return builder.toString();
     }
 
-    private double maxBytesForLevel (int level)
+    private long maxBytesForLevel(int level)
     {
-        return level == 0
-               ? 4 * maxSSTableSizeInMB * 1024 * 1024
-               : Math.pow(10, level) * maxSSTableSizeInMB * 1024 * 1024;
+        if (level == 0)
+            return 4 * maxSSTableSizeInMB * 1024 * 1024;
+        double bytes = Math.pow(10, level) * maxSSTableSizeInMB * 1024 * 1024;
+        if (bytes > Long.MAX_VALUE)
+            throw new RuntimeException("At most " + Long.MAX_VALUE + " bytes may be in a compaction level; your maxSSTableSize must be absurdly high to compute " + bytes);
+        return (long) bytes;
     }
 
     public synchronized Collection<SSTableReader> getCompactionCandidates()
@@ -238,7 +242,7 @@ public class LeveledManifest
             List<SSTableReader> sstables = generations[i];
             if (sstables.isEmpty())
                 continue; // mostly this just avoids polluting the debug log with zero scores
-            double score = SSTableReader.getTotalBytes(sstables) / maxBytesForLevel(i);
+            double score = (double)SSTableReader.getTotalBytes(sstables) / (double)maxBytesForLevel(i);
             logger.debug("Compaction score for level {} is {}", i, score);
 
             // L0 gets a special case that if we don't have anything more important to do,
@@ -343,11 +347,14 @@ public class LeveledManifest
         return overlapping(generations[level].get(0), generations[(level + 1)]);
     }
 
+    public static File tryGetManifest(ColumnFamilyStore cfs)
+    {
+        return cfs.directories.tryGetLeveledManifest();
+    }
+
     public synchronized void serialize()
     {
-        File manifestFile = tryGetManifest(cfs);
-        if (manifestFile == null)
-            manifestFile = new File(new File(DatabaseDescriptor.getAllDataFileLocations()[0], cfs.table.name), cfs.columnFamily + ".json");
+        File manifestFile = cfs.directories.getOrCreateLeveledManifest();
         File oldFile = new File(manifestFile.getPath().replace(EXTENSION, "-old.json"));
         File tmpFile = new File(manifestFile.getPath().replace(EXTENSION, "-tmp.json"));
 
@@ -387,21 +394,6 @@ public class LeveledManifest
         }
     }
 
-    public static File tryGetManifest(ColumnFamilyStore cfs)
-    {
-        for (String dir : DatabaseDescriptor.getAllDataFileLocations())
-        {
-            File manifestFile = new File(new File(dir, cfs.table.name), cfs.columnFamily + EXTENSION);
-            if (manifestFile.exists())
-            {
-                logger.debug("Found manifest at {}", manifestFile);
-                return manifestFile;
-            }
-        }
-        logger.debug("No level manifest found");
-        return null;
-    }
-
     @Override
     public String toString()
     {
@@ -425,12 +417,14 @@ public class LeveledManifest
 
     public int getEstimatedTasks()
     {
-        int n = 0;
+        long tasks = 0;
         for (int i = generations.length - 1; i >= 0; i--)
         {
             List<SSTableReader> sstables = generations[i];
-            n += Math.max(0L, SSTableReader.getTotalBytes(sstables) - maxBytesForLevel(i)) / (maxSSTableSizeInMB * 1024 * 1024);
+            long n = Math.max(0L, SSTableReader.getTotalBytes(sstables) - maxBytesForLevel(i)) / (maxSSTableSizeInMB * 1024 * 1024);
+            logger.debug("Estimating " + n + " compaction tasks in level " + i);
+            tasks += n;
         }
-        return n;
+        return Ints.checkedCast(tasks);
     }
 }

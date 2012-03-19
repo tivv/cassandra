@@ -40,7 +40,6 @@ import javax.management.remote.JMXServiceURL;
 
 import com.google.common.collect.Iterables;
 
-import org.apache.cassandra.cache.InstrumentingCacheMBean;
 import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutorMBean;
 import org.apache.cassandra.config.ConfigurationException;
 import org.apache.cassandra.db.ColumnFamilyStoreMBean;
@@ -52,6 +51,8 @@ import org.apache.cassandra.gms.FailureDetectorMBean;
 import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.MessagingServiceMBean;
+import org.apache.cassandra.service.CacheService;
+import org.apache.cassandra.service.CacheServiceMBean;
 import org.apache.cassandra.service.StorageServiceMBean;
 import org.apache.cassandra.streaming.StreamingService;
 import org.apache.cassandra.streaming.StreamingServiceMBean;
@@ -80,6 +81,7 @@ public class NodeProbe
     private StreamingServiceMBean streamProxy;
     public MessagingServiceMBean msProxy;
     private FailureDetectorMBean fdProxy;
+    private CacheServiceMBean cacheService;
 
     /**
      * Creates a NodeProbe using the specified JMX host, port, username, and password.
@@ -156,6 +158,8 @@ public class NodeProbe
             compactionProxy = JMX.newMBeanProxy(mbeanServerConn, name, CompactionManagerMBean.class);
             name = new ObjectName(FailureDetector.MBEAN_NAME);
             fdProxy = JMX.newMBeanProxy(mbeanServerConn, name, FailureDetectorMBean.class);
+            name = new ObjectName(CacheService.MBEAN_NAME);
+            cacheService = JMX.newMBeanProxy(mbeanServerConn, name, CacheServiceMBean.class);
         } catch (MalformedObjectNameException e)
         {
             throw new RuntimeException(
@@ -208,14 +212,14 @@ public class NodeProbe
         ssProxy.forceTableRepairPrimaryRange(tableName, columnFamilies);
     }
 
-    public void invalidateKeyCaches(String tableName, String... columnFamilies) throws IOException
+    public void invalidateKeyCache() throws IOException
     {
-        ssProxy.invalidateKeyCaches(tableName, columnFamilies);
+        cacheService.invalidateKeyCache();
     }
 
-    public void invalidateRowCaches(String tableName, String... columnFamilies) throws IOException
+    public void invalidateRowCache() throws IOException
     {
-        ssProxy.invalidateRowCaches(tableName, columnFamilies);
+        cacheService.invalidateRowCache();
     }
 
     public void drain() throws IOException, InterruptedException, ExecutionException
@@ -223,7 +227,7 @@ public class NodeProbe
         ssProxy.drain();	
     }
     
-    public Map<Token, String> getTokenToEndpointMap()
+    public Map<String, String> getTokenToEndpointMap()
     {
         return ssProxy.getTokenToEndpointMap();
     }
@@ -258,9 +262,23 @@ public class NodeProbe
         return ssProxy.getLoadMap();
     }
 
-    public Map<Token, Float> getOwnership()
+    public Map<String, Float> getOwnership()
     {
         return ssProxy.getOwnership();
+    }
+
+    public CacheServiceMBean getCacheServiceMBean()
+    {
+        String cachePath = "org.apache.cassandra.db:type=Caches";
+
+        try
+        {
+            return JMX.newMBeanProxy(mbeanServerConn, new ObjectName(cachePath), CacheServiceMBean.class);
+        }
+        catch (MalformedObjectNameException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
 
     public Iterator<Map.Entry<String, ColumnFamilyStoreMBean>> getColumnFamilyStoreMBeanProxies()
@@ -282,32 +300,6 @@ public class NodeProbe
     public CompactionManagerMBean getCompactionManagerProxy()
     {
       return compactionProxy;
-    }
-
-    public InstrumentingCacheMBean getKeyCacheMBean(String tableName, String cfName)
-    {
-        String keyCachePath = "org.apache.cassandra.db:type=Caches,keyspace=" + tableName + ",cache=" + cfName + "KeyCache";
-        try
-        {
-            return JMX.newMBeanProxy(mbeanServerConn, new ObjectName(keyCachePath), InstrumentingCacheMBean.class);
-        }
-        catch (MalformedObjectNameException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-    
-    public InstrumentingCacheMBean getRowCacheMBean(String tableName, String cfName)
-    {
-        String rowCachePath = "org.apache.cassandra.db:type=Caches,keyspace=" + tableName + ",cache=" + cfName + "RowCache";
-        try
-        {
-            return JMX.newMBeanProxy(mbeanServerConn, new ObjectName(rowCachePath), InstrumentingCacheMBean.class);
-        }
-        catch (MalformedObjectNameException e)
-        {
-            throw new RuntimeException(e);
-        }
     }
 
     public String getToken()
@@ -439,14 +431,10 @@ public class NodeProbe
     {
         try
         {
-            String keyCachePath = "org.apache.cassandra.db:type=Caches,keyspace=" + tableName + ",cache=" + cfName + "KeyCache";
-            InstrumentingCacheMBean keyCacheMBean = JMX.newMBeanProxy(mbeanServerConn, new ObjectName(keyCachePath), InstrumentingCacheMBean.class);
-            keyCacheMBean.setCapacity(keyCacheCapacity);
-
-            String rowCachePath = "org.apache.cassandra.db:type=Caches,keyspace=" + tableName + ",cache=" + cfName + "RowCache";
-            InstrumentingCacheMBean rowCacheMBean = null;
-            rowCacheMBean = JMX.newMBeanProxy(mbeanServerConn, new ObjectName(rowCachePath), InstrumentingCacheMBean.class);
-            rowCacheMBean.setCapacity(rowCacheCapacity);
+            String keyCachePath = "org.apache.cassandra.db:type=Caches";
+            CacheServiceMBean cacheMBean = JMX.newMBeanProxy(mbeanServerConn, new ObjectName(keyCachePath), CacheServiceMBean.class);
+            cacheMBean.setKeyCacheCapacityInMB(keyCacheCapacity);
+            cacheMBean.setRowCacheCapacityInMB(rowCacheCapacity);
         }
         catch (MalformedObjectNameException e)
         {
@@ -539,9 +527,9 @@ public class NodeProbe
         // Try to find the endpoint using the local token, doing so in a crazy manner
         // to maintain backwards compatibility with the MBean interface
         String stringToken = ssProxy.getToken();
-        Map<Token, String> tokenToEndpoint = ssProxy.getTokenToEndpointMap();
+        Map<String, String> tokenToEndpoint = ssProxy.getTokenToEndpointMap();
 
-        for (Map.Entry<Token, String> pair : tokenToEndpoint.entrySet())
+        for (Map.Entry<String, String> pair : tokenToEndpoint.entrySet())
         {
             if (pair.getKey().toString().equals(stringToken))
             {
@@ -631,6 +619,11 @@ public class NodeProbe
         ssProxy.loadNewSSTables(ksName, cfName);
     }
 
+    public void rebuildIndex(String ksName, String cfName, String... idxNames)
+    {
+        ssProxy.rebuildSecondaryIndex(ksName, cfName, idxNames);
+    }
+
     public String getGossipInfo()
     {
         return fdProxy.getAllEndpointStates();
@@ -641,10 +634,26 @@ public class NodeProbe
         compactionProxy.stopCompaction(string);
     }
 
+    public void setStreamThroughput(int value)
+    {
+        ssProxy.setStreamThroughputMbPerSec(value);
+    }
+
     public List<String> describeRing(String keyspaceName) throws InvalidRequestException
     {
         return ssProxy.describeRingJMX(keyspaceName);
     }
+
+    public void rebuild(String sourceDc)
+    {
+        ssProxy.rebuild(sourceDc);
+    }
+    
+    public List<String> getRangeKeySample()
+    {
+        return ssProxy.getRangeKeySample();
+    }
+
 }
 
 class ColumnFamilyStoreMBeanIterator implements Iterator<Map.Entry<String, ColumnFamilyStoreMBean>>

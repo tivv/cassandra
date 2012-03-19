@@ -38,6 +38,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionInfo.Holder;
+import org.apache.cassandra.db.index.SecondaryIndex;
 import org.apache.cassandra.db.index.SecondaryIndexBuilder;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -454,7 +455,7 @@ public class CompactionManager implements CompactionManagerMBean
         boolean isCommutative = cfs.metadata.getDefaultValidator().isCommutative();
 
         // Calculate the expected compacted filesize
-        String compactionFileLocation = cfs.table.getDataFileLocation(sstable.onDiskLength());
+        File compactionFileLocation = cfs.directories.getDirectoryForNewSSTables(sstable.onDiskLength());
         if (compactionFileLocation == null)
             throw new IOException("disk full");
         int expectedBloomFilterSize = Math.max(DatabaseDescriptor.getIndexInterval(),
@@ -681,7 +682,7 @@ public class CompactionManager implements CompactionManagerMBean
             logger.info("Cleaning up " + sstable);
             // Calculate the expected compacted filesize
             long expectedRangeFileSize = cfs.getExpectedCompactedFileSize(Arrays.asList(sstable)) / 2;
-            String compactionFileLocation = table.getDataFileLocation(expectedRangeFileSize);
+            File compactionFileLocation = cfs.directories.getDirectoryForNewSSTables(expectedRangeFileSize);
             if (compactionFileLocation == null)
                 throw new IOException("disk full");
 
@@ -709,14 +710,13 @@ public class CompactionManager implements CompactionManagerMBean
                     }
                     else
                     {
-                                              
                         cfs.invalidateCachedRow(row.getKey());
-                                                
+
                         if (!indexedColumns.isEmpty() || isCommutative)
                         {
                             if (indexedColumnsInRow != null)
                                 indexedColumnsInRow.clear();
-                            
+
                             while (row.hasNext())
                             {
                                 IColumn column = row.next();
@@ -726,13 +726,24 @@ public class CompactionManager implements CompactionManagerMBean
                                 {
                                     if (indexedColumnsInRow == null)
                                         indexedColumnsInRow = new ArrayList<IColumn>();
-                                    
+
                                     indexedColumnsInRow.add(column);
                                 }
                             }
-                            
+
                             if (indexedColumnsInRow != null && !indexedColumnsInRow.isEmpty())
-                                cfs.indexManager.deleteFromIndexes(row.getKey(), indexedColumnsInRow);
+                            {
+                                // acquire memtable lock here because secondary index deletion may cause a race. See CASSANDRA-3712
+                                Table.switchLock.readLock().lock();
+                                try
+                                {
+                                    cfs.indexManager.deleteFromIndexes(row.getKey(), indexedColumnsInRow);
+                                }
+                                finally
+                                {
+                                    Table.switchLock.readLock().unlock();
+                                }
+                            }
                         }
                     }
                 }
@@ -748,7 +759,6 @@ public class CompactionManager implements CompactionManagerMBean
             finally
             {
                 scanner.close();
-                executor.finishCompaction(ci);
                 executor.finishCompaction(ci);
             }
 
@@ -767,13 +777,12 @@ public class CompactionManager implements CompactionManagerMBean
 
             // flush to ensure we don't lose the tombstones on a restart, since they are not commitlog'd         
             cfs.indexManager.flushIndexesBlocking();
-           
 
             cfs.replaceCompactedSSTables(Arrays.asList(sstable), results);
         }
     }
 
-    private SSTableWriter maybeCreateWriter(ColumnFamilyStore cfs, String compactionFileLocation, int expectedBloomFilterSize, SSTableWriter writer, Collection<SSTableReader> sstables)
+    private SSTableWriter maybeCreateWriter(ColumnFamilyStore cfs, File compactionFileLocation, int expectedBloomFilterSize, SSTableWriter writer, Collection<SSTableReader> sstables)
             throws IOException
     {
         if (writer == null)
@@ -919,26 +928,18 @@ public class CompactionManager implements CompactionManagerMBean
             public void runMayThrow() throws InterruptedException, IOException
             {
                 compactionLock.writeLock().lock();
+
                 try
                 {
-                    for (ColumnFamilyStore cfs : main.concatWithIndexes())
-                    {
-                        List<SSTableReader> truncatedSSTables = new ArrayList<SSTableReader>();
-                        for (SSTableReader sstable : cfs.getSSTables())
-                        {
-                            if (!sstable.newSince(truncatedAt))
-                                truncatedSSTables.add(sstable);
-                        }
-                        if (!truncatedSSTables.isEmpty())
-                            cfs.markCompacted(truncatedSSTables);
-                    }
+                    main.discardSSTables(truncatedAt);
+
+                    for (SecondaryIndex index : main.indexManager.getIndexes())
+                        index.truncate(truncatedAt);
                 }
                 finally
                 {
                     compactionLock.writeLock().unlock();
                 }
-
-                main.invalidateRowCache();
             }
         };
 
@@ -1049,11 +1050,11 @@ public class CompactionManager implements CompactionManagerMBean
         void finishCompaction(CompactionInfo.Holder ci);
     }
 
-    public List<CompactionInfo> getCompactions()
+    public List<Map<String, String>> getCompactions()
     {
-        List<CompactionInfo> out = new ArrayList<CompactionInfo>();
+        List<Map<String, String>> out = new ArrayList<Map<String, String>>();
         for (CompactionInfo.Holder ci : CompactionExecutor.getCompactions())
-            out.add(ci.getCompactionInfo());
+            out.add(ci.getCompactionInfo().asMap());
         return out;
     }
 

@@ -26,8 +26,11 @@ import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -46,10 +49,15 @@ public class SSTableLoader
     private final Client client;
     private final OutputHandler outputHandler;
 
+    static
+    {
+        Config.setLoadYaml(false);
+    }
+
     public SSTableLoader(File directory, Client client, OutputHandler outputHandler)
     {
         this.directory = directory;
-        this.keyspace = directory.getName();
+        this.keyspace = directory.getParentFile().getName();
         this.client = client;
         this.outputHandler = outputHandler;
     }
@@ -165,10 +173,12 @@ public class SSTableLoader
             return null;
         }
 
-        public Void get(long timeout, TimeUnit unit) throws InterruptedException
+        public Void get(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
         {
-            latch.await(timeout, unit);
-            return null;
+            if (latch.await(timeout, unit))
+                return null;
+            else
+                throw new TimeoutException();
         }
 
         public boolean isCancelled()
@@ -262,6 +272,7 @@ public class SSTableLoader
         protected void setPartitioner(String partclass) throws ConfigurationException
         {
             this.partitioner = FBUtilities.newPartitioner(partclass);
+            DatabaseDescriptor.setPartitioner(partitioner);
         }
 
         public IPartitioner getPartitioner()

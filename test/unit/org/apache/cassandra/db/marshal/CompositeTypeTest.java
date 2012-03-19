@@ -42,18 +42,11 @@ public class CompositeTypeTest extends CleanupHelper
     private static final CompositeType comparator;
     static
     {
-        List<AbstractType> subComparators = new ArrayList<AbstractType>();
+        List<AbstractType<?>> subComparators = new ArrayList<AbstractType<?>>();
         subComparators.add(BytesType.instance);
         subComparators.add(TimeUUIDType.instance);
         subComparators.add(IntegerType.instance);
-        try
-        {
-            comparator = CompositeType.getInstance(subComparators);
-        }
-        catch (ConfigurationException e)
-        {
-            throw new RuntimeException(e);
-        }
+        comparator = CompositeType.getInstance(subComparators);
 
     }
 
@@ -217,6 +210,16 @@ public class CompositeTypeTest extends CleanupHelper
         catch (ConfigurationException e) {}
     }
 
+    @Test
+    public void testCompatibility() throws Exception
+    {
+        assert TypeParser.parse("CompositeType(IntegerType, BytesType)").isCompatibleWith(TypeParser.parse("CompositeType(IntegerType)"));
+        assert TypeParser.parse("CompositeType(IntegerType, BytesType)").isCompatibleWith(TypeParser.parse("CompositeType(IntegerType, BytesType)"));
+        assert TypeParser.parse("CompositeType(BytesType, BytesType)").isCompatibleWith(TypeParser.parse("CompositeType(AsciiType, BytesType)"));
+
+        assert !TypeParser.parse("CompositeType(IntegerType)").isCompatibleWith(TypeParser.parse("CompositeType(IntegerType, BytesType)"));
+        assert !TypeParser.parse("CompositeType(IntegerType)").isCompatibleWith(TypeParser.parse("CompositeType(BytesType)"));
+    }
 
     private void addColumn(RowMutation rm, ByteBuffer cname)
     {

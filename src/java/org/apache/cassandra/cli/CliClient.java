@@ -19,8 +19,7 @@ package org.apache.cassandra.cli;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
+import java.io.PrintStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.util.*;
@@ -35,7 +34,6 @@ import org.antlr.runtime.tree.Tree;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.config.ConfigurationException;
 import org.apache.cassandra.db.ColumnFamilyStoreMBean;
-import org.apache.cassandra.db.compaction.CompactionInfo;
 import org.apache.cassandra.db.compaction.CompactionManagerMBean;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.marshal.*;
@@ -73,14 +71,14 @@ public class CliClient
         ASCII         (AsciiType.instance),
         COUNTERCOLUMN (CounterColumnType.instance);
 
-        private AbstractType validator;
+        private AbstractType<?> validator;
 
-        Function(AbstractType validator)
+        Function(AbstractType<?> validator)
         {
             this.validator = validator;
         }
 
-        public AbstractType getValidator()
+        public AbstractType<?> getValidator()
         {
             return this.validator;
         }
@@ -120,12 +118,8 @@ public class CliClient
         COMPARATOR,
         SUBCOMPARATOR,
         COMMENT,
-        ROWS_CACHED,
-        ROW_CACHE_SAVE_PERIOD,
-        ROW_CACHE_KEYS_TO_SAVE,
-        KEYS_CACHED,
-        KEY_CACHE_SAVE_PERIOD,
         READ_REPAIR_CHANCE,
+        DCLOCAL_READ_REPAIR_CHANCE,
         GC_GRACE,
         COLUMN_METADATA,
         MEMTABLE_OPERATIONS,
@@ -134,11 +128,12 @@ public class CliClient
         MIN_COMPACTION_THRESHOLD,
         MAX_COMPACTION_THRESHOLD,
         REPLICATE_ON_WRITE,
-        ROW_CACHE_PROVIDER,
         KEY_VALIDATION_CLASS,
         COMPACTION_STRATEGY,
         COMPACTION_STRATEGY_OPTIONS,
         COMPRESSION_OPTIONS,
+        BLOOM_FILTER_FP_CHANCE,
+        CACHING
     }
 
     private static final String DEFAULT_PLACEMENT_STRATEGY = "org.apache.cassandra.locator.NetworkTopologyStrategy";
@@ -150,14 +145,14 @@ public class CliClient
     private String keySpace = null;
     private String username = null;
     private Map<String, KsDef> keyspacesMap = new HashMap<String, KsDef>();
-    private Map<String, AbstractType> cfKeysComparators;
+    private Map<String, AbstractType<?>> cfKeysComparators;
     private ConsistencyLevel consistencyLevel = ConsistencyLevel.ONE;
     private CliUserHelp help;
     public CliClient(CliSessionState cliSessionState, Cassandra.Client thriftClient)
     {
         this.sessionState = cliSessionState;
         this.thriftClient = thriftClient;
-        this.cfKeysComparators = new HashMap<String, AbstractType>();
+        this.cfKeysComparators = new HashMap<String, AbstractType<?>>();
     }
 
     private CliUserHelp getHelp()
@@ -463,7 +458,7 @@ public class CliClient
         boolean isSuperCF = cfDef.column_type.equals("Super");
 
         List<ColumnOrSuperColumn> columns = thriftClient.get_slice(key, parent, predicate, consistencyLevel);
-        AbstractType validator;
+        AbstractType<?> validator;
 
         // Print out super columns or columns.
         for (ColumnOrSuperColumn cosc : columns)
@@ -524,7 +519,7 @@ public class CliClient
         elapsedTime(startTime);
     }
 
-    private AbstractType getFormatType(String compareWith)
+    private AbstractType<?> getFormatType(String compareWith)
     {
         Function function;
 
@@ -626,7 +621,7 @@ public class CliClient
             return;
         }
 
-        AbstractType validator = getValidatorForValue(cfDef, TBaseHelper.byteBufferToByteArray(columnName));
+        AbstractType<?> validator = getValidatorForValue(cfDef, TBaseHelper.byteBufferToByteArray(columnName));
 
         // Perform a get()
         ColumnPath path = new ColumnPath(columnFamily);
@@ -663,7 +658,7 @@ public class CliClient
             // .getText() will give us <type>
             String typeName = CliUtils.unescapeSQLString(typeTree.getText());
             // building AbstractType from <type>
-            AbstractType valueValidator = getFormatType(typeName);
+            AbstractType<?> valueValidator = getFormatType(typeName);
 
             // setting value for output
             valueAsString = valueValidator.getString(ByteBuffer.wrap(columnValue));
@@ -913,8 +908,6 @@ public class CliClient
         String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, keyspacesMap.get(keySpace).cf_defs);
         ByteBuffer key = getKeyAsBytes(columnFamily, columnFamilySpec.getChild(1));
         int columnSpecCnt = CliCompiler.numColumnSpecifiers(columnFamilySpec);
-        CfDef cfDef = getCfDef(columnFamily);
-        boolean isSuper = cfDef.column_type.equals("Super");
         
         byte[] superColumnName = null;
         ByteBuffer columnName;
@@ -1114,9 +1107,6 @@ public class CliClient
     private KsDef updateKsDefAttributes(Tree statement, KsDef ksDefToUpdate)
     {
         KsDef ksDef = new KsDef(ksDefToUpdate);
-        // server helpfully sets deprecated replication factor when it sends a KsDef back, for older clients.
-        // we need to unset that on the new KsDef we create to avoid being treated as a legacy client in return.
-        ksDef.unsetReplication_factor();
 
         // removing all column definitions - thrift system_update_keyspace method requires that 
         ksDef.setCf_defs(new LinkedList<CfDef>());
@@ -1154,15 +1144,7 @@ public class CliClient
             {
                 SimpleSnitch snitch = new SimpleSnitch();
                 Map<String, String> options = new HashMap<String, String>();
-
-                try
-                {
-                    options.put(snitch.getDatacenter(InetAddress.getLocalHost()), "1");
-                }
-                catch (UnknownHostException e)
-                {
-                    throw new RuntimeException(e);
-                }
+                options.put(snitch.getDatacenter(FBUtilities.getBroadcastAddress()), "1");
 
                 ksDef.setStrategy_options(options);
             }
@@ -1201,12 +1183,6 @@ public class CliClient
             case COMMENT:
                 cfDef.setComment(CliUtils.unescapeSQLString(mValue));
                 break;
-            case ROWS_CACHED:
-                cfDef.setRow_cache_size(Double.parseDouble(mValue));
-                break;
-            case KEYS_CACHED:
-                cfDef.setKey_cache_size(Double.parseDouble(mValue));
-                break;
             case READ_REPAIR_CHANCE:
                 double chance = Double.parseDouble(mValue);
 
@@ -1214,6 +1190,14 @@ public class CliClient
                     throw new RuntimeException("Error: read_repair_chance must be between 0 and 1.");
 
                 cfDef.setRead_repair_chance(chance);
+                break;
+            case DCLOCAL_READ_REPAIR_CHANCE:
+                double localChance = Double.parseDouble(mValue);
+
+                if (localChance < 0 || localChance > 1)
+                    throw new RuntimeException("Error: dclocal_read_repair_chance must be between 0 and 1.");
+
+                cfDef.setDclocal_read_repair_chance(localChance);
                 break;
             case GC_GRACE:
                 cfDef.setGc_grace_seconds(Integer.parseInt(mValue));
@@ -1228,15 +1212,6 @@ public class CliClient
                 break;
             case MEMTABLE_THROUGHPUT:
                 break;
-            case ROW_CACHE_SAVE_PERIOD:
-                cfDef.setRow_cache_save_period_in_seconds(Integer.parseInt(mValue));
-                break;
-            case KEY_CACHE_SAVE_PERIOD:
-                cfDef.setKey_cache_save_period_in_seconds(Integer.parseInt(mValue));
-                break;
-            case ROW_CACHE_KEYS_TO_SAVE:
-                cfDef.setRow_cache_keys_to_save(Integer.parseInt(mValue));
-                break;
             case DEFAULT_VALIDATION_CLASS:
                 cfDef.setDefault_validation_class(CliUtils.unescapeSQLString(mValue));
                 break;
@@ -1249,9 +1224,6 @@ public class CliClient
             case REPLICATE_ON_WRITE:
                 cfDef.setReplicate_on_write(Boolean.parseBoolean(mValue));
                 break;
-            case ROW_CACHE_PROVIDER:
-                cfDef.setRow_cache_provider(CliUtils.unescapeSQLString(mValue));
-                break;
             case KEY_VALIDATION_CLASS:
                 cfDef.setKey_validation_class(CliUtils.unescapeSQLString(mValue));
                 break;
@@ -1263,6 +1235,12 @@ public class CliClient
                 break;
             case COMPRESSION_OPTIONS:
                 cfDef.setCompression_options(getStrategyOptionsFromTree(statement.getChild(i+1)));
+                break;
+            case BLOOM_FILTER_FP_CHANCE:
+                cfDef.setBloom_filter_fp_chance(Double.parseDouble(mValue));
+                break;
+            case CACHING:
+                cfDef.setCaching(CliUtils.unescapeSQLString(mValue));
                 break;
             default:
                 //must match one of the above or we'd throw an exception at the valueOf statement above.
@@ -1378,7 +1356,7 @@ public class CliClient
 
         // set the key range
         KeyRange range = new KeyRange(limitCount);
-        AbstractType keyComparator = this.cfKeysComparators.get(columnFamily);
+        AbstractType<?> keyComparator = this.cfKeysComparators.get(columnFamily);
         ByteBuffer startKey = rawStartKey.isEmpty() ? ByteBufferUtil.EMPTY_BYTE_BUFFER : getBytesAccordingToType(rawStartKey, keyComparator);
         ByteBuffer endKey = rawEndKey.isEmpty() ? ByteBufferUtil.EMPTY_BYTE_BUFFER : getBytesAccordingToType(rawEndKey, keyComparator);
         range.setStart_key(startKey).setEnd_key(endKey);
@@ -1431,7 +1409,7 @@ public class CliClient
     }
 
     // TRUNCATE <columnFamily>
-    private void executeTruncate(String columnFamily) throws TException, InvalidRequestException, UnavailableException
+    private void executeTruncate(String columnFamily) throws TException, InvalidRequestException, UnavailableException, TimedOutException
     {
         if (!CliMain.isConnected() || !hasKeySpace())
             return;
@@ -1485,7 +1463,7 @@ public class CliClient
         // VALIDATOR | COMPARATOR | KEYS | SUB_COMPARATOR
         String assumptionElement = statement.getChild(1).getText().toUpperCase();
         // used to store in this.cfKeysComparator
-        AbstractType comparator;
+        AbstractType<?> comparator;
 
         // Could be UTF8Type, IntegerType, LexicalUUIDType etc.
         String defaultType = statement.getChild(2).getText();
@@ -1578,24 +1556,23 @@ public class CliClient
         else
             ksIter = keyspaces.iterator();
 
-
-        final StringBuilder sb = new StringBuilder();
         while (ksIter.hasNext())
-            showKeyspace(sb, ksIter.next());
+            showKeyspace(sessionState.out, ksIter.next());
 
-        sessionState.out.printf(sb.toString());
+        sessionState.out.flush();
     }
 
     /**
      * Creates a CLI script to create the Keyspace it's Column Families
-     * @param sb StringBuilder to write to.
+     *
+     * @param output StringBuilder to write to.
      * @param ksDef KsDef to create the cli script for.
      */
-    private void showKeyspace(StringBuilder sb, KsDef ksDef)
+    private void showKeyspace(PrintStream output, KsDef ksDef)
     {
-        sb.append("create keyspace " + ksDef.name);
+        output.append("create keyspace ").append(ksDef.name);
 
-        writeAttr(sb, true, "placement_strategy", normaliseType(ksDef.strategy_class, "org.apache.cassandra.locator"));
+        writeAttr(output, true, "placement_strategy", normaliseType(ksDef.strategy_class, "org.apache.cassandra.locator"));
 
         if (ksDef.strategy_options != null && !ksDef.strategy_options.isEmpty())
         {
@@ -1608,55 +1585,56 @@ public class CliClient
                 prefix = ", ";
             }
             opts.append("}");
-            writeAttrRaw(sb, false, "strategy_options", opts.toString());
+            writeAttrRaw(output, false, "strategy_options", opts.toString());
         }
 
-        writeAttr(sb, false, "durable_writes", ksDef.durable_writes);
+        writeAttr(output, false, "durable_writes", ksDef.durable_writes);
 
-        sb.append(";" + NEWLINE);
-        sb.append(NEWLINE);
+        output.append(";").append(NEWLINE);
+        output.append(NEWLINE);
 
-        sb.append("use " + ksDef.name + ";");
-        sb.append(NEWLINE);
-        sb.append(NEWLINE);
+        output.append("use " + ksDef.name + ";");
+        output.append(NEWLINE);
+        output.append(NEWLINE);
 
         Collections.sort(ksDef.cf_defs, new CfDefNamesComparator());
         for (CfDef cfDef : ksDef.cf_defs)
-            showColumnFamily(sb, cfDef);
-        sb.append(NEWLINE);
-        sb.append(NEWLINE);
+            showColumnFamily(output, cfDef);
+        output.append(NEWLINE);
+        output.append(NEWLINE);
     }
 
     /**
      * Creates a CLI script for the CfDef including meta data to the supplied StringBuilder.
-     * @param sb
-     * @param cfDef
+     *
+     * @param output File to write to.
+     * @param cfDef  CfDef to export attributes from.
      */
-    private void showColumnFamily(StringBuilder sb, CfDef cfDef)
+    private void showColumnFamily(PrintStream output, CfDef cfDef)
     {
-        sb.append("create column family " + CliUtils.escapeSQLString(cfDef.name));
+        output.append("create column family ").append(CliUtils.escapeSQLString(cfDef.name));
 
-        writeAttr(sb, true, "column_type", cfDef.column_type);
-        writeAttr(sb, false, "comparator", normaliseType(cfDef.comparator_type, "org.apache.cassandra.db.marshal"));
+        writeAttr(output, true, "column_type", cfDef.column_type);
+        writeAttr(output, false, "comparator", normaliseType(cfDef.comparator_type, "org.apache.cassandra.db.marshal"));
         if (cfDef.column_type.equals("Super"))
-            writeAttr(sb, false, "subcomparator", normaliseType(cfDef.subcomparator_type, "org.apache.cassandra.db.marshal"));
+            writeAttr(output, false, "subcomparator", normaliseType(cfDef.subcomparator_type, "org.apache.cassandra.db.marshal"));
         if (!StringUtils.isEmpty(cfDef.default_validation_class))
-            writeAttr(sb, false, "default_validation_class",
+            writeAttr(output, false, "default_validation_class",
                         normaliseType(cfDef.default_validation_class, "org.apache.cassandra.db.marshal"));
-        writeAttr(sb, false, "key_validation_class",
+        writeAttr(output, false, "key_validation_class",
                     normaliseType(cfDef.key_validation_class, "org.apache.cassandra.db.marshal"));
-        writeAttr(sb, false, "rows_cached", cfDef.row_cache_size);
-        writeAttr(sb, false, "row_cache_save_period", cfDef.row_cache_save_period_in_seconds);
-        writeAttr(sb, false, "row_cache_keys_to_save", cfDef.row_cache_keys_to_save);
-        writeAttr(sb, false, "keys_cached", cfDef.key_cache_size);
-        writeAttr(sb, false, "key_cache_save_period", cfDef.key_cache_save_period_in_seconds);
-        writeAttr(sb, false, "read_repair_chance", cfDef.read_repair_chance);
-        writeAttr(sb, false, "gc_grace", cfDef.gc_grace_seconds);
-        writeAttr(sb, false, "min_compaction_threshold", cfDef.min_compaction_threshold);
-        writeAttr(sb, false, "max_compaction_threshold", cfDef.max_compaction_threshold);
-        writeAttr(sb, false, "replicate_on_write", cfDef.replicate_on_write);
-        writeAttr(sb, false, "row_cache_provider", normaliseType(cfDef.row_cache_provider, "org.apache.cassandra.cache"));
-        writeAttr(sb, false, "compaction_strategy", cfDef.compaction_strategy);
+
+        writeAttr(output, false, "read_repair_chance", cfDef.read_repair_chance);
+        writeAttr(output, false, "dclocal_read_repair_chance", cfDef.dclocal_read_repair_chance);
+        writeAttr(output, false, "gc_grace", cfDef.gc_grace_seconds);
+        writeAttr(output, false, "min_compaction_threshold", cfDef.min_compaction_threshold);
+        writeAttr(output, false, "max_compaction_threshold", cfDef.max_compaction_threshold);
+        writeAttr(output, false, "replicate_on_write", cfDef.replicate_on_write);
+        writeAttr(output, false, "compaction_strategy", cfDef.compaction_strategy);
+        writeAttr(output, false, "caching", cfDef.caching);
+
+        if (cfDef.isSetBloom_filter_fp_chance())
+            writeAttr(output, false, "bloom_filter_fp_chance", cfDef.bloom_filter_fp_chance);
 
         if (!cfDef.compaction_strategy_options.isEmpty())
         {
@@ -1680,26 +1658,28 @@ public class CliClient
 
             cOptions.append("}");
 
-            writeAttrRaw(sb, false, "compaction_strategy_options", cOptions.toString());
+            writeAttrRaw(output, false, "compaction_strategy_options", cOptions.toString());
         }
 
         if (!StringUtils.isEmpty(cfDef.comment))
-            writeAttr(sb, false, "comment", cfDef.comment);
+            writeAttr(output, false, "comment", cfDef.comment);
 
         if (!cfDef.column_metadata.isEmpty())
         {
-            StringBuilder colSb = new StringBuilder();
-            colSb.append("[");
+            output.append(NEWLINE)
+                  .append(TAB)
+                  .append("and column_metadata = [");
+
             boolean first = true;
             for (ColumnDef colDef : cfDef.column_metadata)
             {
                 if (!first)
-                    colSb.append(",");
+                    output.append(",");
                 first = false;
-                showColumnMeta(colSb, cfDef, colDef);
+                showColumnMeta(output, cfDef, colDef);
             }
-            colSb.append("]");
-            writeAttrRaw(sb, false, "column_metadata", colSb.toString());
+
+            output.append("]");
         }
 
         if (cfDef.compression_options != null && !cfDef.compression_options.isEmpty())
@@ -1722,47 +1702,59 @@ public class CliClient
 
             compOptions.append("}");
 
-            writeAttrRaw(sb, false, "compression_options", compOptions.toString());
+            writeAttrRaw(output, false, "compression_options", compOptions.toString());
         }
 
-        sb.append(";");
-        sb.append(NEWLINE);
-        sb.append(NEWLINE);
+        output.append(";");
+        output.append(NEWLINE);
+        output.append(NEWLINE);
     }
 
     /**
      * Writes the supplied ColumnDef to the StringBuilder as a cli script.
-     * @param sb
-     * @param cfDef
-     * @param colDef
+     *
+     * @param output The File to write to.
+     * @param cfDef  The CfDef as a source for comparator/validator
+     * @param colDef The Column Definition to export
      */
-    private void showColumnMeta(StringBuilder sb, CfDef cfDef, ColumnDef colDef)
+    private void showColumnMeta(PrintStream output, CfDef cfDef, ColumnDef colDef)
     {
-        sb.append(NEWLINE + TAB + TAB + "{");
+        output.append(NEWLINE + TAB + TAB + "{");
 
-        final AbstractType comparator = getFormatType(cfDef.column_type.equals("Super")
+        final AbstractType<?> comparator = getFormatType(cfDef.column_type.equals("Super")
                                                       ? cfDef.subcomparator_type
                                                       : cfDef.comparator_type);
-        sb.append("column_name : '" + CliUtils.escapeSQLString(comparator.getString(colDef.name)) + "'," + NEWLINE);
+        output.append("column_name : '" + CliUtils.escapeSQLString(comparator.getString(colDef.name)) + "'," + NEWLINE);
         String validationClass = normaliseType(colDef.validation_class, "org.apache.cassandra.db.marshal");
-        sb.append(TAB + TAB + "validation_class : " + CliUtils.escapeSQLString(validationClass));
+        output.append(TAB + TAB + "validation_class : " + CliUtils.escapeSQLString(validationClass));
         if (colDef.isSetIndex_name())
         {
-            sb.append("," + NEWLINE);
-            sb.append(TAB + TAB + "index_name : '" + CliUtils.escapeSQLString(colDef.index_name) + "'," + NEWLINE);
-            sb.append(TAB + TAB + "index_type : " + CliUtils.escapeSQLString(Integer.toString(colDef.index_type.getValue())) + "," + NEWLINE);
+            output.append(",").append(NEWLINE)
+                  .append(TAB + TAB + "index_name : '" + CliUtils.escapeSQLString(colDef.index_name) + "'," + NEWLINE)
+                  .append(TAB + TAB + "index_type : " + CliUtils.escapeSQLString(Integer.toString(colDef.index_type.getValue())));
 
             if (colDef.index_options != null)
             {
-                sb.append(TAB + TAB + "index_options : {"+NEWLINE);        
+                output.append(",").append(NEWLINE);
+                output.append(TAB + TAB + "index_options : {" + NEWLINE);
+                int numOpts = colDef.index_options.size();
                 for (Map.Entry<String, String> entry : colDef.index_options.entrySet())
                 {
-                    sb.append(TAB + TAB + TAB + CliUtils.escapeSQLString(entry.getKey()) + ": '" + CliUtils.escapeSQLString(entry.getValue()) + "'," + NEWLINE);
+                    String option = CliUtils.escapeSQLString(entry.getKey());
+                    String optionValue = CliUtils.escapeSQLString(entry.getValue());
+
+                    output.append(TAB + TAB + TAB)
+                          .append("'" + option + "' : '")
+                          .append(optionValue)
+                          .append("'");
+
+                    if (--numOpts > 0)
+                        output.append(",").append(NEWLINE);
                 }
-                sb.append("}");
+                output.append("}");
             }
         }
-        sb.append("}");
+        output.append("}");
     }
 
     private String normaliseType(String path, String expectedPackage)
@@ -1773,26 +1765,26 @@ public class CliClient
         return path;
     }
 
-    private void writeAttr(StringBuilder sb, boolean first, String name, Boolean value)
+    private void writeAttr(PrintStream output, boolean first, String name, Boolean value)
     {
-        writeAttrRaw(sb, first, name, value.toString());
+        writeAttrRaw(output, first, name, value.toString());
     }
-    private void writeAttr(StringBuilder sb, boolean first, String name, Number value)
+    private void writeAttr(PrintStream output, boolean first, String name, Number value)
     {
-        writeAttrRaw(sb, first, name, value.toString());
-    }
-
-    private void writeAttr(StringBuilder sb, boolean first, String name, String value)
-    {
-        writeAttrRaw(sb, first, name, "'" + CliUtils.escapeSQLString(value) + "'");
+        writeAttrRaw(output, first, name, value.toString());
     }
 
-    private void writeAttrRaw(StringBuilder sb, boolean first, String name, String value)
+    private void writeAttr(PrintStream output, boolean first, String name, String value)
     {
-        sb.append(NEWLINE + TAB);
-        sb.append(first ? "with " : "and ");
-        sb.append(name + " = ");
-        sb.append(value);
+        writeAttrRaw(output, first, name, "'" + CliUtils.escapeSQLString(value) + "'");
+    }
+
+    private void writeAttrRaw(PrintStream output, boolean first, String name, String value)
+    {
+        output.append(NEWLINE).append(TAB);
+        output.append(first ? "with " : "and ");
+        output.append(name).append(" = ");
+        output.append(value);
     }
     /**
      * Returns true if this.keySpace is set, false otherwise
@@ -1936,15 +1928,15 @@ public class CliClient
             // compaction manager information
             if (compactionManagerMBean != null)
             {
-                for (CompactionInfo info : compactionManagerMBean.getCompactions())
+                for (Map<String, String> info : compactionManagerMBean.getCompactions())
                 {
                     // if ongoing compaction type is index build
-                    if (info.getTaskType() != OperationType.INDEX_BUILD)
+                    if (info.get("taskType").equals(OperationType.INDEX_BUILD.toString()))
                         continue;
                     sessionState.out.printf("%nCurrently building index %s, completed %d of %d bytes.%n",
-                                            info.getColumnFamily(),
-                                            info.getBytesComplete(),
-                                            info.getTotalBytes());
+                                            info.get("columnfamily"),
+                                            info.get("bytesComplete"),
+                                            info.get("totalBytes"));
                 }
             }
 
@@ -1984,15 +1976,13 @@ public class CliClient
             sessionState.out.printf("      Default column value validator: %s%n", cf_def.default_validation_class);
 
         sessionState.out.printf("      Columns sorted by: %s%s%n", cf_def.comparator_type, cf_def.column_type.equals("Super") ? "/" + cf_def.subcomparator_type : "");
-        sessionState.out.printf("      Row cache size / save period in seconds / keys to save : %s/%s/%s%n",
-                cf_def.row_cache_size, cf_def.row_cache_save_period_in_seconds,
-                cf_def.row_cache_keys_to_save == Integer.MAX_VALUE ? "all" : cf_def.row_cache_keys_to_save);
-        sessionState.out.printf("      Row Cache Provider: %s%n", cf_def.getRow_cache_provider());
-        sessionState.out.printf("      Key cache size / save period in seconds: %s/%s%n", cf_def.key_cache_size, cf_def.key_cache_save_period_in_seconds);
         sessionState.out.printf("      GC grace seconds: %s%n", cf_def.gc_grace_seconds);
         sessionState.out.printf("      Compaction min/max thresholds: %s/%s%n", cf_def.min_compaction_threshold, cf_def.max_compaction_threshold);
         sessionState.out.printf("      Read repair chance: %s%n", cf_def.read_repair_chance);
+        sessionState.out.printf("      DC Local Read repair chance: %s%n", cf_def.dclocal_read_repair_chance);
         sessionState.out.printf("      Replicate on write: %s%n", cf_def.replicate_on_write);
+        sessionState.out.printf("      Caching: %s%n", cf_def.caching);
+        sessionState.out.printf("      Bloom Filter FP chance: %s%n", cf_def.isSetBloom_filter_fp_chance() ? cf_def.bloom_filter_fp_chance : "default");
 
         // if we have connection to the cfMBean established
         if (cfMBean != null)
@@ -2005,7 +1995,7 @@ public class CliClient
 
             String compareWith = isSuper ? cf_def.subcomparator_type
                     : cf_def.comparator_type;
-            AbstractType columnNameValidator = getFormatType(compareWith);
+            AbstractType<?> columnNameValidator = getFormatType(compareWith);
 
             sessionState.out.println(leftSpace + "Column Metadata:");
             for (ColumnDef columnDef : cf_def.getColumn_metadata())
@@ -2032,6 +2022,9 @@ public class CliClient
 
                 if (columnDef.isSetIndex_type())
                     sessionState.out.println(columnLeftSpace + "Index Type: " + columnDef.getIndex_type().name());
+
+                if (columnDef.isSetIndex_options())
+                    sessionState.out.println(columnLeftSpace + "Index Options: " + columnDef.getIndex_options());
             }
         }
 
@@ -2329,7 +2322,7 @@ public class CliClient
      * @param comparator - comparator used to convert object
      * @return byte[] - object in the byte array representation
      */
-    private ByteBuffer getBytesAccordingToType(String object, AbstractType comparator)
+    private ByteBuffer getBytesAccordingToType(String object, AbstractType<?> comparator)
     {
         if (comparator == null) // default comparator is BytesType
             comparator = BytesType.instance;
@@ -2441,7 +2434,7 @@ public class CliClient
     private ByteBuffer columnValueAsBytes(ByteBuffer columnName, String columnFamilyName, String columnValue)
     {
         CfDef columnFamilyDef = getCfDef(columnFamilyName);
-        AbstractType defaultValidator = getFormatType(columnFamilyDef.default_validation_class);
+        AbstractType<?> defaultValidator = getFormatType(columnFamilyDef.default_validation_class);
 
         for (ColumnDef columnDefinition : columnFamilyDef.getColumn_metadata())
         {
@@ -2470,7 +2463,7 @@ public class CliClient
      * @param columnNameInBytes - column name as byte array
      * @return AbstractType - validator for column value
      */
-    private AbstractType getValidatorForValue(CfDef ColumnFamilyDef, byte[] columnNameInBytes)
+    private AbstractType<?> getValidatorForValue(CfDef ColumnFamilyDef, byte[] columnNameInBytes)
     {
         String defaultValidator = ColumnFamilyDef.default_validation_class;
         
@@ -2555,7 +2548,7 @@ public class CliClient
         String functionName = functionCall.getChild(0).getText();
         Tree argumentTree = functionCall.getChild(1);
         String functionArg  = (argumentTree == null) ? "" : CliUtils.unescapeSQLString(argumentTree.getText());
-        AbstractType validator = getTypeByFunction(functionName);
+        AbstractType<?> validator = getTypeByFunction(functionName);
 
         try
         {
@@ -2605,7 +2598,7 @@ public class CliClient
      * @param functionName - name of the function e.g. utf8, integer, long etc.
      * @return AbstractType type corresponding to the function name
      */
-    public static AbstractType getTypeByFunction(String functionName)
+    public static AbstractType<?> getTypeByFunction(String functionName)
     {
         Function function;
 
@@ -2683,9 +2676,9 @@ public class CliClient
     private void printSliceList(CfDef columnFamilyDef, List<KeySlice> slices)
             throws NotFoundException, TException, IllegalAccessException, InstantiationException, NoSuchFieldException, CharacterCodingException
     {
-        AbstractType validator;
+        AbstractType<?> validator;
         String columnFamilyName = columnFamilyDef.getName();
-        AbstractType keyComparator = getKeyComparatorForCF(columnFamilyName);
+        AbstractType<?> keyComparator = getKeyComparatorForCF(columnFamilyName);
 
         for (KeySlice ks : slices)
         {
@@ -2786,9 +2779,9 @@ public class CliClient
         return getBytesAccordingToType(key, getKeyComparatorForCF(columnFamily));
     }
 
-    private AbstractType getKeyComparatorForCF(String columnFamily)
+    private AbstractType<?> getKeyComparatorForCF(String columnFamily)
     {
-        AbstractType keyComparator = cfKeysComparators.get(columnFamily);
+        AbstractType<?> keyComparator = cfKeysComparators.get(columnFamily);
 
         if (keyComparator == null)
         {

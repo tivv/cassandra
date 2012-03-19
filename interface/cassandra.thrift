@@ -46,7 +46,7 @@ namespace rb CassandraThrift
 #           for every edit that doesn't result in a change to major/minor.
 #
 # See the Semantic Versioning Specification (SemVer) http://semver.org.
-const string VERSION = "19.20.0"
+const string VERSION = "19.28.0"
 
 
 #
@@ -284,11 +284,15 @@ struct IndexExpression {
     3: required binary value,
 }
 
+/**
+ * @Deprecated: use a KeyRange with row_filter in get_range_slices instead
+ */
 struct IndexClause {
-    1: required list<IndexExpression> expressions
+    1: required list<IndexExpression> expressions,
     2: required binary start_key,
     3: required i32 count=100,
 }
+
 
 /**
 The semantics of start keys and tokens are slightly different.
@@ -303,6 +307,7 @@ struct KeyRange {
     2: optional binary end_key,
     3: optional string start_token,
     4: optional string end_token,
+    6: optional list<IndexExpression> row_filter,
     5: required i32 count=100
 }
 
@@ -394,8 +399,6 @@ struct CfDef {
     5: optional string comparator_type="BytesType",
     6: optional string subcomparator_type,
     8: optional string comment,
-    9: optional double row_cache_size=0,
-    11: optional double key_cache_size=200000,
     12: optional double read_repair_chance=1.0,
     13: optional list<ColumnDef> column_metadata,
     14: optional i32 gc_grace_seconds,
@@ -403,17 +406,18 @@ struct CfDef {
     16: optional i32 id,
     17: optional i32 min_compaction_threshold,
     18: optional i32 max_compaction_threshold,
-    19: optional i32 row_cache_save_period_in_seconds,
-    20: optional i32 key_cache_save_period_in_seconds,
     24: optional bool replicate_on_write,
     25: optional double merge_shards_chance,
     26: optional string key_validation_class,
-    27: optional string row_cache_provider,
     28: optional binary key_alias,
     29: optional string compaction_strategy,
     30: optional map<string,string> compaction_strategy_options,
-    31: optional i32 row_cache_keys_to_save,
     32: optional map<string,string> compression_options,
+    33: optional double bloom_filter_fp_chance,
+    34: optional string caching="keys_only",
+    35: optional list<binary> column_aliases,
+    36: optional binary value_alias,
+    37: optional double dclocal_read_repair_chance = 0.0,
 }
 
 /* describes a keyspace. */
@@ -421,9 +425,6 @@ struct KsDef {
     1: required string name,
     2: required string strategy_class,
     3: optional map<string,string> strategy_options,
-
-    /** @deprecated */
-    4: optional i32 replication_factor, 
 
     5: required list<CfDef> cf_defs,
     6: optional bool durable_writes=1,
@@ -463,7 +464,8 @@ struct CqlResult {
 
 struct CqlPreparedResult {
     1: required i32 itemId,
-    2: required i32 count
+    2: required i32 count,
+    3: optional list<string> variable_types
 }
 
 
@@ -532,7 +534,19 @@ service Cassandra {
                                   4:required ConsistencyLevel consistency_level=ConsistencyLevel.ONE)
                  throws (1:InvalidRequestException ire, 2:UnavailableException ue, 3:TimedOutException te),
 
-  /** Returns the subset of columns specified in SlicePredicate for the rows matching the IndexClause */
+  /**
+   returns a range of columns, wrapping to the next rows if necessary to collect max_results.
+  */
+  list<KeySlice> get_paged_slice(1:required string column_family,
+                                 2:required KeyRange range,
+                                 3:required binary start_column,
+                                 4:required ConsistencyLevel consistency_level=ConsistencyLevel.ONE)
+                 throws (1:InvalidRequestException ire, 2:UnavailableException ue, 3:TimedOutException te),
+
+  /**
+    Returns the subset of columns specified in SlicePredicate for the rows matching the IndexClause
+    @Deprecated; use get_range_slices instead with range.row_filter specified
+    */
   list<KeySlice> get_indexed_slices(1:required ColumnParent column_parent,
                                     2:required IndexClause index_clause,
                                     3:required SlicePredicate column_predicate,
@@ -599,7 +613,7 @@ service Cassandra {
    some hosts are down.
   */
   void truncate(1:required string cfname)
-       throws (1: InvalidRequestException ire, 2: UnavailableException ue),
+       throws (1: InvalidRequestException ire, 2: UnavailableException ue, 3: TimedOutException te),
 
 
     
@@ -705,11 +719,11 @@ service Cassandra {
    * Executes a prepared CQL (Cassandra Query Language) statement by passing an id token and  a list of variables
    * to bind and returns a CqlResult containing the results.
    */
-  CqlResult execute_prepared_cql_query(1:required i32 itemId, 2:required list<string> values)
+  CqlResult execute_prepared_cql_query(1:required i32 itemId, 2:required list<binary> values)
     throws (1:InvalidRequestException ire,
             2:UnavailableException ue,
             3:TimedOutException te,
             4:SchemaDisagreementException sde)
-           
 
+  void set_cql_version(1: required string version) throws (1:InvalidRequestException ire)
 }

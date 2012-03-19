@@ -25,7 +25,6 @@ import com.google.common.collect.AbstractIterator;
 
 import org.apache.cassandra.db.columniterator.IColumnIterator;
 import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.sstable.SSTableReader;
 import org.apache.cassandra.io.sstable.SSTableScanner;
 import org.apache.cassandra.utils.CloseableIterator;
@@ -33,8 +32,6 @@ import org.apache.cassandra.utils.MergeIterator;
 
 public class RowIteratorFactory
 {
-
-    private static final int RANGE_FILE_BUFFER_SIZE = 256 * 1024;
 
     private static final Comparator<IColumnIterator> COMPARE_BY_KEY = new Comparator<IColumnIterator>()
     {
@@ -53,7 +50,7 @@ public class RowIteratorFactory
      * @param startWith Start at this key
      * @param stopAt Stop and this key
      * @param filter Used to decide which columns to pull out
-     * @param comparator
+     * @param cfs
      * @return A row iterator following all the given restrictions
      */
     public static CloseableIterator<Row> getIterator(final Iterable<Memtable> memtables,
@@ -65,21 +62,11 @@ public class RowIteratorFactory
     {
         // fetch data from current memtable, historical memtables, and SSTables in the correct order.
         final List<CloseableIterator<IColumnIterator>> iterators = new ArrayList<CloseableIterator<IColumnIterator>>();
-        // we iterate through memtables with a priority queue to avoid more sorting than necessary.
-        // this predicate throws out the rows before the start of our range.
-        Predicate<IColumnIterator> p = new Predicate<IColumnIterator>()
-        {
-            public boolean apply(IColumnIterator row)
-            {
-                return startWith.compareTo(row.getKey()) <= 0
-                       && (stopAt.isMinimum() || row.getKey().compareTo(stopAt) <= 0);
-            }
-        };
 
         // memtables
         for (Memtable memtable : memtables)
         {
-            iterators.add(new ConvertToColumnIterator(filter, p, memtable.getEntryIterator(startWith)));
+            iterators.add(new ConvertToColumnIterator(filter, memtable.getEntryIterator(startWith, stopAt)));
         }
 
         for (SSTableReader sstable : sstables)
@@ -90,7 +77,6 @@ public class RowIteratorFactory
             iterators.add(scanner);
         }
 
-        final Memtable firstMemtable = memtables.iterator().next();
         // reduce rows from all sources into a single row
         return MergeIterator.get(iterators, COMPARE_BY_KEY, new MergeIterator.Reducer<IColumnIterator, Row>()
         {
@@ -140,24 +126,20 @@ public class RowIteratorFactory
     private static class ConvertToColumnIterator extends AbstractIterator<IColumnIterator> implements CloseableIterator<IColumnIterator>
     {
         private final QueryFilter filter;
-        private final Predicate<IColumnIterator> pred;
         private final Iterator<Map.Entry<DecoratedKey, ColumnFamily>> iter;
 
-        public ConvertToColumnIterator(QueryFilter filter, Predicate<IColumnIterator> pred, Iterator<Map.Entry<DecoratedKey, ColumnFamily>> iter)
+        public ConvertToColumnIterator(QueryFilter filter, Iterator<Map.Entry<DecoratedKey, ColumnFamily>> iter)
         {
             this.filter = filter;
-            this.pred = pred;
             this.iter = iter;
         }
 
         public IColumnIterator computeNext()
         {
-            while (iter.hasNext())
+            if (iter.hasNext())
             {
                 Map.Entry<DecoratedKey, ColumnFamily> entry = iter.next();
-                IColumnIterator ici = filter.getMemtableColumnIterator(entry.getValue(), entry.getKey());
-                if (pred.apply(ici))
-                    return ici;
+                return filter.getMemtableColumnIterator(entry.getValue(), entry.getKey());
             }
             return endOfData();
         }

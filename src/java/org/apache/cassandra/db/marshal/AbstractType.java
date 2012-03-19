@@ -89,7 +89,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
                     return 1;
                 }
 
-                return -AbstractType.this.compare(o1, o2);
+                return AbstractType.this.compare(o2, o1);
             }
         };
     }
@@ -144,7 +144,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         return false;
     }
 
-    public static AbstractType parseDefaultParameters(AbstractType baseType, TypeParser parser) throws ConfigurationException
+    public static AbstractType<?> parseDefaultParameters(AbstractType<?> baseType, TypeParser parser) throws ConfigurationException
     {
         Map<String, String> parameters = parser.getKeyValueParameters();
         String reversed = parameters.get("reversed");
@@ -156,6 +156,21 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         {
             return baseType;
         }
+    }
+
+    /**
+     * Returns true if this comparator is compatible with the provided
+     * previous comparator, that is if previous can safely be replaced by this.
+     * A comparator cn should be compatible with a previous one cp if forall columns c1 and c2,
+     * if   cn.validate(c1) and cn.validate(c2) and cn.compare(c1, c2) == v,
+     * then cp.validate(c1) and cp.validate(c2) and cp.compare(c1, c2) == v.
+     *
+     * Note that a type should be compatible with at least itself and when in
+     * doubt, keep the default behavior of not being compatible with any other comparator!
+     */
+    public boolean isCompatibleWith(AbstractType<?> previous)
+    {
+        return this == previous;
     }
 
     /**

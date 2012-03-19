@@ -33,22 +33,22 @@ public interface ColumnFamilyStoreMBean
      * @return the name of the column family
      */
     public String getColumnFamilyName();
-    
+
     /**
      * Returns the total amount of data stored in the memtable, including
      * column related overhead.
-     * 
+     *
      * @return The size in bytes.
      */
     public long getMemtableDataSize();
-    
+
     /**
      * Returns the total number of columns present in the memtable.
-     * 
+     *
      * @return The number of columns.
      */
     public long getMemtableColumnsCount();
-    
+
     /**
      * Returns the number of times that a flush has resulted in the
      * memtable being switched out.
@@ -56,11 +56,6 @@ public interface ColumnFamilyStoreMBean
      * @return the number of memtable switches
      */
     public int getMemtableSwitchCount();
-
-    /**
-     * Triggers an immediate memtable flush.
-     */
-    public Object forceFlush() throws IOException;
 
     /**
      * @return a histogram of the number of sstable data files accessed per read: reading this property resets it
@@ -101,7 +96,7 @@ public interface ColumnFamilyStoreMBean
      * @return the number of write operations on this column family
      */
     public long getWriteCount();
-    
+
     /**
      * @return total write latency (divide by getReadCount() for average)
      */
@@ -146,17 +141,6 @@ public interface ColumnFamilyStoreMBean
      * force a major compaction of this column family
      */
     public void forceMajorCompaction() throws ExecutionException, InterruptedException;
-
-    /**
-     * invalidate the key cache; for use after invalidating row cache
-     */
-    public void invalidateKeyCache();
-
-    /**
-     * invalidate the row cache; for use after bulk loading via BinaryMemtable
-     */
-    public void invalidateRowCache();
-
 
     /**
      * return the size of the smallest compacted row
@@ -207,6 +191,17 @@ public interface ColumnFamilyStoreMBean
     public void setMaximumCompactionThreshold(int threshold);
 
     /**
+     * Sets the compaction strategy by class name
+     * @param className the name of the compaction strategy class
+     */
+    public void setCompactionStrategyClass(String className) throws ConfigurationException;
+
+    /**
+     * Gets the compaction strategy class name
+     */
+    public String getCompactionStrategyClass();
+
+    /**
      * Disable automatic compaction.
      */
     public void disableAutoCompaction();
@@ -222,15 +217,6 @@ public interface ColumnFamilyStoreMBean
      * @return list of the index names
      */
     public List<String> getBuiltIndexes();
-
-    public int getRowCacheSavePeriodInSeconds();
-    public void setRowCacheSavePeriodInSeconds(int rcspis);
-
-    public int getKeyCacheSavePeriodInSeconds();
-    public void setKeyCacheSavePeriodInSeconds(int kcspis);
-
-    public int getRowCacheKeysToSave();
-    public void setRowCacheKeysToSave(int keysToSave);
 
     /**
      * Scan through Keyspace/ColumnFamily's data directory

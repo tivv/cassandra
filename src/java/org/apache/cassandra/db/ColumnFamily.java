@@ -23,6 +23,8 @@ import static org.apache.cassandra.db.DBConstants.*;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 
+import org.apache.commons.lang.builder.HashCodeBuilder;
+
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.filter.QueryPath;
@@ -30,6 +32,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.MarshalException;
 import org.apache.cassandra.io.IColumnSerializer;
 import org.apache.cassandra.utils.Allocator;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.HeapAllocator;
 
@@ -61,7 +64,7 @@ public class ColumnFamily extends AbstractColumnContainer
 
     public static ColumnFamily create(CFMetaData cfm)
     {
-        return create(cfm, ThreadSafeSortedColumns.factory());
+        return create(cfm, TreeMapBackedSortedColumns.factory());
     }
 
     public static ColumnFamily create(CFMetaData cfm, ISortedColumns.Factory factory)
@@ -84,8 +87,7 @@ public class ColumnFamily extends AbstractColumnContainer
     public ColumnFamily cloneMeShallow(ISortedColumns.Factory factory, boolean reversedInsertOrder)
     {
         ColumnFamily cf = ColumnFamily.create(cfm, factory, reversedInsertOrder);
-        // since deletion info is immutable, aliasing it is fine
-        cf.deletionInfo.set(deletionInfo.get());
+        cf.delete(this);
         return cf;
     }
 
@@ -94,7 +96,7 @@ public class ColumnFamily extends AbstractColumnContainer
         return cloneMeShallow(columns.getFactory(), columns.isInsertReversed());
     }
 
-    public AbstractType getSubComparator()
+    public AbstractType<?> getSubComparator()
     {
         IColumnSerializer s = getColumnSerializer();
         return (s instanceof SuperColumnSerializer) ? ((SuperColumnSerializer) s).getComparator() : null;
@@ -108,8 +110,7 @@ public class ColumnFamily extends AbstractColumnContainer
     public ColumnFamily cloneMe()
     {
         ColumnFamily cf = new ColumnFamily(cfm, columns.cloneMe());
-        // since deletion info is immutable, aliasing it is fine
-        cf.deletionInfo.set(deletionInfo.get());
+        cf.delete(this);
         return cf;
     }
 
@@ -126,10 +127,6 @@ public class ColumnFamily extends AbstractColumnContainer
         return cfm;
     }
 
-    /**
-     * FIXME: shouldn't need to hold a reference to a serializer; worse, for super cfs,
-     * it will be a _unique_ serializer object per row
-     */
     public IColumnSerializer getColumnSerializer()
     {
         return cfm.getColumnSerializer();
@@ -258,16 +255,31 @@ public class ColumnFamily extends AbstractColumnContainer
         return maxTimestamp;
     }
 
+    @Override
     public int hashCode()
     {
-        throw new RuntimeException("Not implemented.");
+        return new HashCodeBuilder(373, 75437)
+                    .append(cfm)
+                    .append(getMarkedForDeleteAt())
+                    .append(columns).toHashCode();
     }
 
+    @Override
     public boolean equals(Object o)
     {
-        throw new RuntimeException("Not implemented.");
+        if (this == o)
+            return true;
+        if (o == null || this.getClass() != o.getClass())
+            return false;
+
+        ColumnFamily comparison = (ColumnFamily) o;
+
+        return cfm.equals(comparison.cfm)
+                && getMarkedForDeleteAt() == comparison.getMarkedForDeleteAt()
+                && ByteBufferUtil.compareUnsigned(digest(this), digest(comparison)) == 0;
     }
 
+    @Override
     public String toString()
     {
         StringBuilder sb = new StringBuilder("ColumnFamily(");
@@ -295,7 +307,7 @@ public class ColumnFamily extends AbstractColumnContainer
             column.updateDigest(digest);
     }
 
-    public static AbstractType getComparatorFor(String table, String columnFamilyName, ByteBuffer superColumnName)
+    public static AbstractType<?> getComparatorFor(String table, String columnFamilyName, ByteBuffer superColumnName)
     {
         return superColumnName == null
                ? Schema.instance.getComparator(table, columnFamilyName)

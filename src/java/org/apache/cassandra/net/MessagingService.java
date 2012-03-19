@@ -26,11 +26,10 @@ import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousCloseException;
 import java.nio.channels.ServerSocketChannel;
 import java.util.*;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
@@ -99,9 +98,7 @@ public final class MessagingService implements MessagingServiceMBean
      * means the overhead in the degenerate case of having streamed to everyone in the ring over time as a ring changes,
      * is not going to be a thread per node - but rather an instance per node. That's totally fine.
      */
-    private final HashMap<InetAddress, DebuggableThreadPoolExecutor> streamExecutors = new HashMap<InetAddress, DebuggableThreadPoolExecutor>();
-    /** Very rarely acquired lock protecting streamExecutors. */
-    private final Lock streamExecutorsLock = new ReentrantLock();
+    private final ConcurrentMap<InetAddress, DebuggableThreadPoolExecutor> streamExecutors = new NonBlockingHashMap<InetAddress, DebuggableThreadPoolExecutor>();
     private final AtomicInteger activeStreamsOutbound = new AtomicInteger(0);
 
     private final NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool> connectionManagers_ = new NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool>();
@@ -248,6 +245,7 @@ public final class MessagingService implements MessagingServiceMBean
      */
     public void listen(InetAddress localEp) throws IOException, ConfigurationException
     {
+        callbacks.reset(); // hack to allow tests to stop/restart MS
         for (ServerSocket ss: getServerSocket(localEp))
         {
             SocketThread th = new SocketThread(ss, "ACCEPT-" + localEp);
@@ -474,24 +472,25 @@ public final class MessagingService implements MessagingServiceMBean
 
     public void stream(StreamHeader header, InetAddress to)
     {
-        this.streamExecutorsLock.lock();
-        try
+        DebuggableThreadPoolExecutor executor = streamExecutors.get(to);
+        if (executor == null)
         {
-            if (!streamExecutors.containsKey(to))
+            // Using a core pool size of 0 is important. See documentation of streamExecutors.
+            executor = new DebuggableThreadPoolExecutor(0,
+                                                        1,
+                                                        1,
+                                                        TimeUnit.SECONDS,
+                                                        new LinkedBlockingQueue<Runnable>(),
+                                                        new NamedThreadFactory("Streaming to " + to));
+            DebuggableThreadPoolExecutor old = streamExecutors.putIfAbsent(to, executor);
+            if (old != null)
             {
-                // Using a core pool size of 0 is important. See documentation of streamExecutors.
-                streamExecutors.put(to, new DebuggableThreadPoolExecutor(0, 1, 1, TimeUnit.SECONDS,
-                        new LinkedBlockingQueue<Runnable>(),
-                        new NamedThreadFactory("Streaming to " + to)));
+                executor.shutdown();
+                executor = old;
             }
-            DebuggableThreadPoolExecutor executor = streamExecutors.get(to);
+        }
 
-            executor.execute(new FileStreamTask(header, to));
-        }
-        finally
-        {
-            this.streamExecutorsLock.unlock();
-        }
+        executor.execute(new FileStreamTask(header, to));
     }
 
     public void incrementActiveStreamsOutbound()
@@ -517,50 +516,36 @@ public final class MessagingService implements MessagingServiceMBean
 
     public void clearCallbacksUnsafe()
     {
-        callbacks.clear();
+        callbacks.reset();
     }
 
     public void waitForStreaming() throws InterruptedException
     {
-        while (true)
-        {
-            boolean stillWaiting = false;
+        // this does not prevent new streams from beginning after a drain begins, but since streams are only
+        // started in response to explicit operator action (bootstrap/move/repair/etc) that feels like a feature.
+        for (DebuggableThreadPoolExecutor e : streamExecutors.values())
+            e.shutdown();
 
-            streamExecutorsLock.lock();
-            try
-            {
-                for (DebuggableThreadPoolExecutor e : streamExecutors.values())
-                {
-                    if (!e.isTerminated())
-                    {
-                        stillWaiting = true;
-                        break;
-                    }
-                }
-            }
-            finally
-            {
-                streamExecutorsLock.unlock();
-            }
-            if (stillWaiting)
-            {
-                // Up to a second of unneeded delay is acceptable, relative to the amount of time a typical stream
-                // takes.
-                Thread.sleep(1000);
-            }
-            else
-            {
-                break;
-            }
+        for (DebuggableThreadPoolExecutor e : streamExecutors.values())
+        {
+            if (e.awaitTermination(24, TimeUnit.HOURS))
+                logger_.error("Stream took more than 24H to complete; skipping");
         }
     }
 
+    /**
+     * Wait for callbacks and don't allow any more to be created (since they could require writing hints)
+     */
     public void shutdown()
     {
-        logger_.info("Shutting down MessageService...");
+        logger_.info("Waiting for messaging service to quiesce");
         // We may need to schedule hints on the mutation stage, so it's erroneous to shut down the mutation stage first
         assert !StageManager.getStage(Stage.MUTATION).isShutdown();
 
+        // the important part
+        callbacks.shutdown();
+
+        // attempt to humor tests that try to stop and restart MS
         try
         {
             for (SocketThread th : socketThreads)
@@ -570,24 +555,6 @@ public final class MessagingService implements MessagingServiceMBean
         {
             throw new IOError(e);
         }
-
-        streamExecutorsLock.lock();
-        try
-        {
-            for (DebuggableThreadPoolExecutor e : streamExecutors.values())
-            {
-                e.shutdown();
-            }
-        }
-        finally
-        {
-            streamExecutorsLock.unlock();
-        }
-
-        callbacks.shutdown();
-
-        logger_.info("Waiting for in-progress requests to complete");
-        callbacks.shutdown();
     }
 
     public void receive(Message message, String id)
@@ -602,7 +569,7 @@ public final class MessagingService implements MessagingServiceMBean
 
         Runnable runnable = new MessageDeliveryTask(message, id);
         ExecutorService stage = StageManager.getStage(message.getMessageType());
-        assert stage != null : "No stage for message type " + message.getMessageType();
+        assert stage != null : "No stage for message type " + message.getVerb();
         stage.execute(runnable);
     }
 

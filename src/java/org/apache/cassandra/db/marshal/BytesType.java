@@ -40,7 +40,7 @@ public class BytesType extends AbstractType<ByteBuffer>
 
     public ByteBuffer decompose(ByteBuffer value)
     {
-        return value;
+        return JdbcBytes.instance.decompose(value);
     }
     
     public int compare(ByteBuffer o1, ByteBuffer o2)
@@ -78,5 +78,13 @@ public class BytesType extends AbstractType<ByteBuffer>
     public void validate(ByteBuffer bytes) throws MarshalException
     {
         // all bytes are legal.
+    }
+
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> previous)
+    {
+        // Both asciiType and utf8Type really use bytes comparison and
+        // bytesType validate everything, so it is compatible with the former.
+        return this == previous || previous == AsciiType.instance || previous == UTF8Type.instance;
     }
 }

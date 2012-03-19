@@ -46,7 +46,6 @@ import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.filter.QueryFilter;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Bounds;
 import org.apache.cassandra.dht.IPartitioner;
@@ -812,10 +811,6 @@ public class StorageProxy implements StorageProxyMBean
         return new ReadCallback(resolver, consistencyLevel, command, endpoints);
     }
 
-    /*
-    * This function executes the read protocol locally.  Consistency checks are performed in the background.
-    */
-
     public static List<Row> getRangeSlice(RangeSliceCommand command, ConsistencyLevel consistency_level)
     throws IOException, UnavailableException, TimeoutException
     {
@@ -826,24 +821,33 @@ public class StorageProxy implements StorageProxyMBean
         // now scan until we have enough results
         try
         {
-            rows = new ArrayList<Row>(command.max_keys);
+            int columnsCount = 0;
+            rows = new ArrayList<Row>();
             List<AbstractBounds<RowPosition>> ranges = getRestrictedRanges(command.range);
             for (AbstractBounds<RowPosition> range : ranges)
             {
-                List<InetAddress> liveEndpoints = StorageService.instance.getLiveNaturalEndpoints(command.keyspace, range.right);
+                RangeSliceCommand nodeCmd = new RangeSliceCommand(command.keyspace,
+                                                                  command.column_family,
+                                                                  command.super_column,
+                                                                  command.predicate,
+                                                                  range,
+                                                                  command.row_filter,
+                                                                  command.maxResults,
+                                                                  command.maxIsColumns);
+
+                List<InetAddress> liveEndpoints = StorageService.instance.getLiveNaturalEndpoints(nodeCmd.keyspace, range.right);
                 DatabaseDescriptor.getEndpointSnitch().sortByProximity(FBUtilities.getBroadcastAddress(), liveEndpoints);
 
                 if (consistency_level == ConsistencyLevel.ONE && !liveEndpoints.isEmpty() && liveEndpoints.get(0).equals(FBUtilities.getBroadcastAddress()))
                 {
                     if (logger.isDebugEnabled())
                         logger.debug("local range slice");
-                    ColumnFamilyStore cfs = Table.open(command.keyspace).getColumnFamilyStore(command.column_family);
+
                     try
                     {
-                        rows.addAll(cfs.getRangeSlice(command.super_column,
-                                                    range,
-                                                    command.max_keys,
-                                                    QueryFilter.getFilter(command.predicate, cfs.getComparator())));
+                        rows.addAll(RangeSliceVerbHandler.executeLocally(nodeCmd));
+                        for (Row row : rows)
+                            columnsCount += row.getLiveColumnCount();
                     }
                     catch (ExecutionException e)
                     {
@@ -856,17 +860,16 @@ public class StorageProxy implements StorageProxyMBean
                 }
                 else
                 {
-                    RangeSliceCommand c2 = new RangeSliceCommand(command.keyspace, command.column_family, command.super_column, command.predicate, range, command.max_keys);
-
                     // collect replies and resolve according to consistency level
-                    RangeSliceResponseResolver resolver = new RangeSliceResponseResolver(command.keyspace, liveEndpoints);
-                    ReadCallback<Iterable<Row>> handler = getReadCallback(resolver, command, consistency_level, liveEndpoints);
+                    RangeSliceResponseResolver resolver = new RangeSliceResponseResolver(nodeCmd.keyspace);
+                    ReadCallback<Iterable<Row>> handler = getReadCallback(resolver, nodeCmd, consistency_level, liveEndpoints);
                     handler.assureSufficientLiveNodes();
+                    resolver.setSources(handler.endpoints);
                     for (InetAddress endpoint : handler.endpoints)
                     {
-                        MessagingService.instance().sendRR(c2, endpoint, handler);
+                        MessagingService.instance().sendRR(nodeCmd, endpoint, handler);
                         if (logger.isDebugEnabled())
-                            logger.debug("reading " + c2 + " from " + endpoint);
+                            logger.debug("reading " + nodeCmd + " from " + endpoint);
                     }
 
                     try
@@ -874,6 +877,7 @@ public class StorageProxy implements StorageProxyMBean
                         for (Row row : handler.get())
                         {
                             rows.add(row);
+                            columnsCount += row.getLiveColumnCount();
                             logger.debug("range slices read {}", row.key);
                         }
                         FBUtilities.waitOnFutures(resolver.repairResults, DatabaseDescriptor.getRpcTimeout());
@@ -891,7 +895,8 @@ public class StorageProxy implements StorageProxyMBean
                 }
 
                 // if we're done, great, otherwise, move to the next range
-                if (rows.size() >= command.max_keys)
+                int count = nodeCmd.maxIsColumns ? columnsCount : rows.size();
+                if (count >= nodeCmd.maxResults)
                     break;
             }
         }
@@ -899,7 +904,16 @@ public class StorageProxy implements StorageProxyMBean
         {
             rangeStats.addNano(System.nanoTime() - startTime);
         }
-        return rows.size() > command.max_keys ? rows.subList(0, command.max_keys) : rows;
+        return trim(command, rows);
+    }
+
+    private static List<Row> trim(RangeSliceCommand command, List<Row> rows)
+    {
+        // When maxIsColumns, we let the caller trim the result.
+        if (command.maxIsColumns)
+            return rows;
+        else
+            return rows.size() > command.maxResults ? rows.subList(0, command.maxResults) : rows;
     }
 
     /**
@@ -1007,28 +1021,29 @@ public class StorageProxy implements StorageProxyMBean
         AbstractBounds<T> remainder = queryRange;
         while (ringIter.hasNext())
         {
-            Token token = ringIter.next();
             /*
              * remainder can be a range/bounds of token _or_ keys and we want to split it with a token:
              *   - if remainder is tokens, then we'll just split using the provided token.
-             *   - if reaminer is keys, we want to split using token.upperBoundKey. For instance, if remainder
+             *   - if remainder is keys, we want to split using token.upperBoundKey. For instance, if remainder
              *     is [DK(10, 'foo'), DK(20, 'bar')], and we have 3 nodes with tokens 0, 15, 30. We want to
              *     split remainder to A=[DK(10, 'foo'), 15] and B=(15, DK(20, 'bar')]. But since we can't mix
              *     tokens and keys at the same time in a range, we uses 15.upperBoundKey() to have A include all
              *     keys having 15 as token and B include none of those (since that is what our node owns).
              * asSplitValue() abstracts that choice.
              */
-            T splitValue = (T)token.asSplitValue(queryRange.left.getClass());
-            if (remainder == null || !(remainder.left.equals(splitValue) || remainder.contains(splitValue)))
+            Token upperBoundToken = ringIter.next();
+            T upperBound = (T)upperBoundToken.upperBound(queryRange.left.getClass());
+            if (!remainder.left.equals(upperBound) && !remainder.contains(upperBound))
                 // no more splits
                 break;
-            Pair<AbstractBounds<T>,AbstractBounds<T>> splits = remainder.split(splitValue);
-            if (splits.left != null)
-                ranges.add(splits.left);
+            Pair<AbstractBounds<T>,AbstractBounds<T>> splits = remainder.split(upperBound);
+            if (splits == null)
+                continue;
+
+            ranges.add(splits.left);
             remainder = splits.right;
         }
-        if (remainder != null)
-            ranges.add(remainder);
+        ranges.add(remainder);
         if (logger.isDebugEnabled())
             logger.debug("restricted ranges for query {} are {}", queryRange, ranges);
 
@@ -1108,69 +1123,6 @@ public class StorageProxy implements StorageProxyMBean
     public long[] getRecentWriteLatencyHistogramMicros()
     {
         return writeStats.getRecentLatencyHistogramMicros();
-    }
-
-    public static List<Row> scan(final String keyspace, String column_family, IndexClause index_clause, SlicePredicate column_predicate, ConsistencyLevel consistency_level)
-    throws IOException, TimeoutException, UnavailableException
-    {
-        IPartitioner p = StorageService.getPartitioner();
-
-        RowPosition leftPos = RowPosition.forKey(index_clause.start_key, p);
-        List<AbstractBounds<RowPosition>> ranges = getRestrictedRanges(new Bounds<RowPosition>(leftPos, p.getMinimumToken().minKeyBound()));
-        logger.debug("scan ranges are {}", StringUtils.join(ranges, ","));
-
-        // now scan until we have enough results
-        List<Row> rows = new ArrayList<Row>(index_clause.count);
-        for (AbstractBounds<RowPosition> range : ranges)
-        {
-            List<InetAddress> liveEndpoints = StorageService.instance.getLiveNaturalEndpoints(keyspace, range.right);
-            DatabaseDescriptor.getEndpointSnitch().sortByProximity(FBUtilities.getBroadcastAddress(), liveEndpoints);
-
-            // collect replies and resolve according to consistency level
-            RangeSliceResponseResolver resolver = new RangeSliceResponseResolver(keyspace, liveEndpoints);
-            IReadCommand iCommand = new IReadCommand()
-            {
-                public String getKeyspace()
-                {
-                    return keyspace;
-                }
-            };
-            ReadCallback<Iterable<Row>> handler = getReadCallback(resolver, iCommand, consistency_level, liveEndpoints);
-            handler.assureSufficientLiveNodes();
-
-            IndexScanCommand command = new IndexScanCommand(keyspace, column_family, index_clause, column_predicate, range);
-            MessageProducer producer = new CachingMessageProducer(command);
-            for (InetAddress endpoint : handler.endpoints)
-            {
-                MessagingService.instance().sendRR(producer, endpoint, handler);
-                if (logger.isDebugEnabled())
-                    logger.debug("reading {} from {}", command, endpoint);
-            }
-
-            try
-            {
-                for (Row row : handler.get())
-                {
-                    rows.add(row);
-                    logger.debug("read {}", row);
-                }
-                FBUtilities.waitOnFutures(resolver.repairResults, DatabaseDescriptor.getRpcTimeout());
-            }
-            catch (TimeoutException ex)
-            {
-                if (logger.isDebugEnabled())
-                    logger.debug("Index scan timeout: {}", ex.toString());
-                throw ex;
-            }
-            catch (DigestMismatchException e)
-            {
-                throw new AssertionError(e);
-            }
-            if (rows.size() >= index_clause.count)
-                return rows.subList(0, index_clause.count);
-        }
-
-        return rows;
     }
 
     public boolean getHintedHandoffEnabled()
@@ -1311,5 +1263,15 @@ public class StorageProxy implements StorageProxyMBean
     {
         if (getHintsInProgress() > 0)
             logger.warn("Some hints were not written before shutdown.  This is not supposed to happen.  You should (a) run repair, and (b) file a bug report");
+    }
+
+    public Long getRpcTimeout()
+    {
+        return DatabaseDescriptor.getRpcTimeout();
+    }
+
+    public void setRpcTimeout(Long timeoutInMillis)
+    {
+        DatabaseDescriptor.setRpcTimeout(timeoutInMillis);
     }
 }

@@ -106,7 +106,7 @@ public class Column implements IColumn
 
     public boolean isMarkedForDelete()
     {
-        return false;
+        return (int) (System.currentTimeMillis() / 1000) >= getLocalDeletionTime();
     }
 
     public long getMarkedForDeleteAt()
@@ -115,6 +115,11 @@ public class Column implements IColumn
     }
 
     public long mostRecentLiveChangeAt()
+    {
+        return timestamp;
+    }
+
+    public long mostRecentNonGCableChangeAt(int gcbefore)
     {
         return timestamp;
     }
@@ -185,7 +190,7 @@ public class Column implements IColumn
 
     public int getLocalDeletionTime()
     {
-        throw new IllegalStateException("column is not marked for delete");
+        return Integer.MAX_VALUE;
     }
 
     public IColumn reconcile(IColumn column)
@@ -244,7 +249,7 @@ public class Column implements IColumn
         return new Column(cfs.internOrCopy(name, allocator), allocator.clone(value), timestamp);
     }
 
-    public String getString(AbstractType comparator)
+    public String getString(AbstractType<?> comparator)
     {
         StringBuilder sb = new StringBuilder();
         sb.append(comparator.getString(name));
@@ -264,21 +269,21 @@ public class Column implements IColumn
 
     protected void validateName(CFMetaData metadata) throws MarshalException
     {
-        AbstractType nameValidator = metadata.cfType == ColumnFamilyType.Super ? metadata.subcolumnComparator : metadata.comparator;
+        AbstractType<?> nameValidator = metadata.cfType == ColumnFamilyType.Super ? metadata.subcolumnComparator : metadata.comparator;
         nameValidator.validate(name());
     }
 
     public void validateFields(CFMetaData metadata) throws MarshalException
     {
         validateName(metadata);
-        AbstractType valueValidator = metadata.getValueValidator(name());
+        AbstractType<?> valueValidator = metadata.getValueValidator(name());
         if (valueValidator != null)
             valueValidator.validate(value());
     }
 
     public boolean hasExpiredTombstones(int gcBefore)
     {
-        return isMarkedForDelete() && getLocalDeletionTime() < gcBefore;
+        return getLocalDeletionTime() < gcBefore;
     }
 }
 

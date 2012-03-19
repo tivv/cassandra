@@ -24,6 +24,8 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongArray;
 
+import com.google.common.base.Objects;
+
 import org.apache.cassandra.io.ISerializer;
 
 public class EstimatedHistogram
@@ -181,6 +183,17 @@ public class EstimatedHistogram
     }
 
     /**
+     * @return the total number of non-zero values
+     */
+    public long count()
+    {
+       long sum = 0L;
+       for (int i = 0; i < buckets.length(); i++) 
+           sum += buckets.get(i);
+       return sum;
+    }
+
+    /**
      * @return true if this histogram has overflowed -- that is, a value larger than our largest bucket could bound was added
      */
     public boolean isOverflowed()
@@ -200,6 +213,12 @@ public class EstimatedHistogram
         EstimatedHistogram that = (EstimatedHistogram) o;
         return Arrays.equals(getBucketOffsets(), that.getBucketOffsets()) &&
                Arrays.equals(getBuckets(false), that.getBuckets(false));
+    }
+
+    @Override
+    public int hashCode()
+    {
+        return Objects.hashCode(getBucketOffsets(), getBuckets(false));
     }
 
     public static class EstimatedHistogramSerializer implements ISerializer<EstimatedHistogram>

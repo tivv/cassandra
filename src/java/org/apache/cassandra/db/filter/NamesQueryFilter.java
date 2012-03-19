@@ -87,7 +87,7 @@ public class NamesQueryFilter implements IFilter
         }
     }
 
-    public Comparator<IColumn> getColumnComparator(AbstractType comparator)
+    public Comparator<IColumn> getColumnComparator(AbstractType<?> comparator)
     {
         return comparator.columnComparator;
     }
@@ -103,5 +103,9 @@ public class NamesQueryFilter implements IFilter
     public boolean isReversed()
     {
         return false;
+    }
+
+    public void updateColumnsLimit(int newLimit)
+    {
     }
 }

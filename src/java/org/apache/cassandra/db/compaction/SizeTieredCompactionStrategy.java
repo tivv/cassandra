@@ -35,15 +35,17 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
     private static final Logger logger = LoggerFactory.getLogger(SizeTieredCompactionStrategy.class);
     protected static final long DEFAULT_MIN_SSTABLE_SIZE = 50L * 1024L * 1024L;
     protected static final String MIN_SSTABLE_SIZE_KEY = "min_sstable_size";
-    protected static long minSSTableSize;
+    protected long minSSTableSize;
     protected volatile int estimatedRemainingTasks;
 
     public SizeTieredCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
-       super(cfs, options);
-       this.estimatedRemainingTasks = 0;
-       String optionValue = options.get(MIN_SSTABLE_SIZE_KEY);
-       minSSTableSize = (null != optionValue) ? Long.parseLong(optionValue) : DEFAULT_MIN_SSTABLE_SIZE;
+        super(cfs, options);
+        this.estimatedRemainingTasks = 0;
+        String optionValue = options.get(MIN_SSTABLE_SIZE_KEY);
+        minSSTableSize = (null != optionValue) ? Long.parseLong(optionValue) : DEFAULT_MIN_SSTABLE_SIZE;
+        cfs.setMaximumCompactionThreshold(cfs.metadata.getMaxCompactionThreshold());
+        cfs.setMinimumCompactionThreshold(cfs.metadata.getMinCompactionThreshold());
     }
 
     public AbstractCompactionTask getNextBackgroundTask(final int gcBefore)
@@ -107,8 +109,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
     public AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, final int gcBefore)
     {
         return new CompactionTask(cfs, sstables, gcBefore)
-                .isUserDefined(true)
-                .compactionFileLocation(cfs.table.getDataFileLocation(1));
+                .isUserDefined(true);
     }
 
     public int getEstimatedRemainingTasks()

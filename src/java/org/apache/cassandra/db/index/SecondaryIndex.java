@@ -70,7 +70,6 @@ public abstract class SecondaryIndex
      */
     public abstract void validateOptions() throws ConfigurationException;
 
-    
     /**
      * @return The name of the index
      */
@@ -97,6 +96,16 @@ public abstract class SecondaryIndex
         return SystemTable.isIndexBuilt(baseCfs.table.name, getNameForSystemTable(columnName));
     }
     
+    public void setIndexBuilt(ByteBuffer columnName)
+    {
+        SystemTable.setIndexBuilt(baseCfs.table.name, getNameForSystemTable(columnName));
+    }
+
+    public void setIndexRemoved(ByteBuffer columnName)
+    {
+        SystemTable.setIndexRemoved(baseCfs.table.name, getNameForSystemTable(columnName));
+    }
+    
     /**
      * Called at query time
      * Creates a implementation specific searcher instance for this index type
@@ -111,6 +120,11 @@ public abstract class SecondaryIndex
      */
     public abstract void forceBlockingFlush() throws IOException;
 
+    /**
+     * Get current amount of memory this index is consuming (in bytes)
+     */
+    public abstract long getLiveSize();
+    
     /**
      * Allow access to the underlying column family store if there is one
      * @return the underlying column family store or null
@@ -128,7 +142,13 @@ public abstract class SecondaryIndex
      * Remove the index and unregisters this index's mbean if one exists
      */
     public abstract void invalidate();
-    
+
+    /**
+     * Truncate all the data from the current index
+     *
+     * @param truncatedAt The truncation timestamp, all data before that timestamp should be rejected.
+     */
+    public abstract void truncate(long truncatedAt);
     
     /**
      * Builds the index using the data in the underlying CFS

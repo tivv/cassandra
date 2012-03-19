@@ -109,32 +109,63 @@ public class TokenMetadata
     {
         int n = 0;
         Range<Token> sourceRange = getPrimaryRangeFor(getToken(source));
-        for (Token token : bootstrapTokens.keySet())
-            if (sourceRange.contains(token))
-                n++;
+        synchronized (bootstrapTokens)
+        {
+            for (Token token : bootstrapTokens.keySet())
+                if (sourceRange.contains(token))
+                    n++;
+        }
         return n;
     }
 
+    /**
+     * Update token map with a single token/endpoint pair in normal state.
+     */
     public void updateNormalToken(Token token, InetAddress endpoint)
     {
-        assert token != null;
-        assert endpoint != null;
+        updateNormalTokens(Collections.singleton(Pair.create(token, endpoint)));
+    }
+
+    /**
+     * Update token map with a set of token/endpoint pairs in normal state.
+     *
+     * Prefer this whenever there are multiple pairs to update, as each update (whether a single or multiple)
+     * is expensive (CASSANDRA-3831).
+     *
+     * @param tokenPairs
+     */
+    public void updateNormalTokens(Set<Pair<Token, InetAddress>> tokenPairs)
+    {
+        if (tokenPairs.isEmpty())
+            return;
 
         lock.writeLock().lock();
         try
         {
-            bootstrapTokens.inverse().remove(endpoint);
-            tokenToEndpointMap.inverse().remove(endpoint);
-            InetAddress prev = tokenToEndpointMap.put(token, endpoint);
-            if (!endpoint.equals(prev))
+            boolean shouldSortTokens = false;
+            for (Pair<Token, InetAddress> tokenEndpointPair : tokenPairs)
             {
-                if (prev != null)
-                    logger.warn("Token " + token + " changing ownership from " + prev + " to " + endpoint);
-                sortedTokens = sortTokens();
+                Token token = tokenEndpointPair.left;
+                InetAddress endpoint = tokenEndpointPair.right;
+
+                assert token != null;
+                assert endpoint != null;
+
+                bootstrapTokens.inverse().remove(endpoint);
+                tokenToEndpointMap.inverse().remove(endpoint);
+                InetAddress prev = tokenToEndpointMap.put(token, endpoint);
+                if (!endpoint.equals(prev))
+                {
+                    if (prev != null)
+                        logger.warn("Token " + token + " changing ownership from " + prev + " to " + endpoint);
+                    shouldSortTokens = true;
+                }
+                leavingEndpoints.remove(endpoint);
+                removeFromMoving(endpoint); // also removing this endpoint from moving
             }
-            leavingEndpoints.remove(endpoint);
-            removeFromMoving(endpoint); // also removing this endpoint from moving
-            invalidateCaches();
+
+            if (shouldSortTokens)
+                sortedTokens = sortTokens();
         }
         finally
         {
@@ -405,11 +436,6 @@ public class TokenMetadata
         }
     }
 
-    public Set<Map.Entry<Token,InetAddress>> entrySet()
-    {
-        return tokenToEndpointMap.entrySet();
-    }
-
     public InetAddress getEndpoint(Token token)
     {
         lock.readLock().lock();
@@ -606,14 +632,17 @@ public class TokenMetadata
                 }
             }
 
-            if (!bootstrapTokens.isEmpty())
+            synchronized (bootstrapTokens)
             {
-                sb.append("Bootstrapping Tokens:" );
-                sb.append(System.getProperty("line.separator"));
-                for (Map.Entry<Token, InetAddress> entry : bootstrapTokens.entrySet())
+                if (!bootstrapTokens.isEmpty())
                 {
-                    sb.append(entry.getValue() + ":" + entry.getKey());
+                    sb.append("Bootstrapping Tokens:" );
                     sb.append(System.getProperty("line.separator"));
+                    for (Map.Entry<Token, InetAddress> entry : bootstrapTokens.entrySet())
+                    {
+                        sb.append(entry.getValue() + ":" + entry.getKey());
+                        sb.append(System.getProperty("line.separator"));
+                    }
                 }
             }
 
@@ -707,13 +736,43 @@ public class TokenMetadata
     }
 
     /**
-     * Return the Token to Endpoint map for all the node in the cluster, including bootstrapping ones.
+     * @return a token to endpoint map to consider for read operations on the cluster.
      */
-    public Map<Token, InetAddress> getTokenToEndpointMap()
+    public Map<Token, InetAddress> getTokenToEndpointMapForReading()
     {
-        Map<Token, InetAddress> map = new HashMap<Token, InetAddress>(tokenToEndpointMap.size() + bootstrapTokens.size());
-        map.putAll(tokenToEndpointMap);
-        map.putAll(bootstrapTokens);
-        return map;
+        lock.readLock().lock();
+        try
+        {
+            Map<Token, InetAddress> map = new HashMap<Token, InetAddress>(tokenToEndpointMap.size());
+            map.putAll(tokenToEndpointMap);
+            return map;
+        }
+        finally
+        {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * @return a (stable copy, won't be modified) Token to Endpoint map for all the normal and bootstrapping nodes
+     *         in the cluster.
+     */
+    public Map<Token, InetAddress> getNormalAndBootstrappingTokenToEndpointMap()
+    {
+        lock.readLock().lock();
+        try
+        {
+            Map<Token, InetAddress> map = new HashMap<Token, InetAddress>(tokenToEndpointMap.size() + bootstrapTokens.size());
+            map.putAll(tokenToEndpointMap);
+            synchronized (bootstrapTokens)
+            {
+                map.putAll(bootstrapTokens);
+            }
+            return map;
+        }
+        finally
+        {
+            lock.readLock().unlock();
+        }
     }
 }

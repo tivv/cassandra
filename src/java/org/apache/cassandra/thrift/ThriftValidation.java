@@ -235,7 +235,7 @@ public class ThriftValidation
             if (metadata.cfType == ColumnFamilyType.Standard)
                 throw new InvalidRequestException("supercolumn specified to ColumnFamily " + metadata.cfName + " containing normal columns");
         }
-        AbstractType comparator = metadata.getComparatorFor(superColumnName);
+        AbstractType<?> comparator = metadata.getComparatorFor(superColumnName);
         for (ByteBuffer name : column_names)
         {
             if (name.remaining() > IColumn.MAX_NAME_LENGTH)
@@ -260,7 +260,7 @@ public class ThriftValidation
 
     public static void validateRange(CFMetaData metadata, ColumnParent column_parent, SliceRange range) throws InvalidRequestException
     {
-        AbstractType comparator = metadata.getComparatorFor(column_parent.super_column);
+        AbstractType<?> comparator = metadata.getComparatorFor(column_parent.super_column);
         try
         {
             comparator.validate(range.start);
@@ -428,7 +428,7 @@ public class ThriftValidation
         ColumnDefinition columnDef = metadata.getColumnDefinition(column.name);
         try
         {
-            AbstractType validator = metadata.getValueValidator(columnDef);
+            AbstractType<?> validator = metadata.getValueValidator(columnDef);
             if (validator != null)
                 validator.validate(column.value);
         }
@@ -479,7 +479,7 @@ public class ThriftValidation
             validateColumnNames(metadata, column_parent, predicate.column_names);
     }
 
-    public static void validateKeyRange(KeyRange range) throws InvalidRequestException
+    public static void validateKeyRange(CFMetaData metadata, ByteBuffer superColumn, KeyRange range) throws InvalidRequestException
     {
         if ((range.start_key == null) != (range.end_key == null))
         {
@@ -508,10 +508,22 @@ public class ThriftValidation
             }
         }
 
+        validateFilterClauses(metadata, range.row_filter);
+
+        if (!isEmpty(range.row_filter) && superColumn != null)
+        {
+            throw new InvalidRequestException("super columns are not yet supported for indexing");
+        }
+
         if (range.count <= 0)
         {
             throw new InvalidRequestException("maxRows must be positive");
         }
+    }
+
+    private static boolean isEmpty(List<IndexExpression> clause)
+    {
+        return clause == null || clause.isEmpty();
     }
 
     public static void validateIndexClauses(CFMetaData metadata, IndexClause index_clause)
@@ -519,11 +531,24 @@ public class ThriftValidation
     {
         if (index_clause.expressions.isEmpty())
             throw new InvalidRequestException("index clause list may not be empty");
+
+        if (!validateFilterClauses(metadata, index_clause.expressions))
+            throw new InvalidRequestException("No indexed columns present in index clause with operator EQ");
+    }
+
+    // return true if index_clause contains an indexed columns with operator EQ
+    public static boolean validateFilterClauses(CFMetaData metadata, List<IndexExpression> index_clause)
+    throws InvalidRequestException
+    {
+        if (isEmpty(index_clause))
+            // no filter to apply
+            return false;
+
         Set<ByteBuffer> indexedColumns = Table.open(metadata.ksName).getColumnFamilyStore(metadata.cfName).indexManager.getIndexedColumns();
-        AbstractType nameValidator =  ColumnFamily.getComparatorFor(metadata.ksName, metadata.cfName, null);
+        AbstractType<?> nameValidator =  ColumnFamily.getComparatorFor(metadata.ksName, metadata.cfName, null);
 
         boolean isIndexed = false;
-        for (IndexExpression expression : index_clause.expressions)
+        for (IndexExpression expression : index_clause)
         {
             try
             {
@@ -537,7 +562,7 @@ public class ThriftValidation
                                                                 me.getMessage()));
             }
 
-            AbstractType valueValidator = Schema.instance.getValueValidator(metadata.ksName, metadata.cfName, expression.column_name);
+            AbstractType<?> valueValidator = Schema.instance.getValueValidator(metadata.ksName, metadata.cfName, expression.column_name);
             try
             {
                 valueValidator.validate(expression.value);
@@ -553,14 +578,15 @@ public class ThriftValidation
             isIndexed |= (expression.op == IndexOperator.EQ) && indexedColumns.contains(expression.column_name);
         }
 
-        if (!isIndexed)
-            throw new InvalidRequestException("No indexed columns present in index clause with operator EQ");
+        return isIndexed;
     }
 
     public static void validateCfDef(CfDef cf_def, CFMetaData old) throws InvalidRequestException
     {
         try
         {
+            if (cf_def.name.length() > 32)
+                throw new InvalidRequestException(String.format("Column family names shouldn't be more than 32 character long (got \"%s\")", cf_def.name));
             if (cf_def.key_alias != null)
             {
                 if (!cf_def.key_alias.hasRemaining())
@@ -591,10 +617,6 @@ public class ThriftValidation
             if (cf_def.column_metadata == null)
                 return;
 
-            AbstractType comparator = cfType == ColumnFamilyType.Standard
-                                    ? TypeParser.parse(cf_def.comparator_type)
-                                    : TypeParser.parse(cf_def.subcomparator_type);
-
             if (cf_def.key_alias != null)
             {
                 // check if any of the columns has name equal to the cf.key_alias
@@ -616,6 +638,8 @@ public class ThriftValidation
                         indexNames.add(cd.getIndexName());
             }
 
+            AbstractType<?> comparator = CFMetaData.getColumnDefinitionComparator(cf_def);
+
             for (ColumnDef c : cf_def.column_metadata)
             {
                 TypeParser.parse(c.validation_class);
@@ -627,7 +651,7 @@ public class ThriftValidation
                 catch (MarshalException e)
                 {
                     throw new InvalidRequestException(String.format("Column name %s is not valid for comparator %s",
-                                                                    ByteBufferUtil.bytesToHex(c.name), cf_def.comparator_type));
+                                                                    ByteBufferUtil.bytesToHex(c.name), comparator));
                 }
 
                 if (c.index_type == null)
@@ -693,9 +717,12 @@ public class ThriftValidation
 
     public static void validateKsDef(KsDef ks_def) throws ConfigurationException
     {
+        if (ks_def.name.length() > 32)
+            throw new ConfigurationException(String.format("Keyspace names shouldn't be more than 32 character long (got \"%s\")", ks_def.name));
+
         // Attempt to instantiate the ARS, which will throw a ConfigException if
         //  the strategy_options aren't fully formed or if the ARS Classname is invalid.
-        Map<String, String> options = KSMetaData.forwardsCompatibleOptions(ks_def);
+        Map<String, String> options = ks_def.strategy_options == null ? Collections.<String, String>emptyMap() : ks_def.strategy_options;
         TokenMetadata tmd = StorageService.instance.getTokenMetadata();
         IEndpointSnitch eps = DatabaseDescriptor.getEndpointSnitch();
         Class<? extends AbstractReplicationStrategy> cls = AbstractReplicationStrategy.getClass(ks_def.strategy_class);
@@ -751,5 +778,11 @@ public class ThriftValidation
                                                                 newKsName,
                                                                 ksName));
         }
+    }
+
+    public static void validateKeyspaceNotSystem(String modifiedKeyspace) throws InvalidRequestException
+    {
+        if (modifiedKeyspace.equalsIgnoreCase(Table.SYSTEM_TABLE))
+            throw new InvalidRequestException("system keyspace is not user-modifiable");
     }
 }

@@ -488,9 +488,14 @@ bc(syntax).
 <createColumnFamilyStatement> ::= "CREATE" "COLUMNFAMILY" <name>
                                     "(" <term> <storageType> "PRIMARY" "KEY"
                                         ( "," <term> <storageType> )* ")"
-                                   ( "WITH" <identifier> "=" <cfOptionVal>
-                                     ( "AND" <identifier> "=" <cfOptionVal> )* )?
+                                   ( "WITH" <optionName> "=" <cfOptionVal>
+                                     ( "AND" <optionName> "=" <cfOptionVal> )* )?
                                 ;
+<optionName> ::= <identifier>
+               | <optionName> ":" <identifier>
+               | <optionName> ":" <integer>
+               ;
+
 <cfOptionVal> ::= <storageType>
                 | <identifier>
                 | <stringLiteral>
@@ -528,7 +533,7 @@ CREATE ... ( ... , name1 type1, name2 type2, ... ) ...
 
 It is possible to assign columns a type during column family creation. Columns configured with a type are validated accordingly when a write occurs, and intelligent CQL drivers and interfaces will be able to decode the column values correctly when receiving them. Column types are specified as a parenthesized, comma-separated list of column term and type pairs. See "Data Storage Types":#storageTypes for the list of recognized types.
 
-h3. Column Family Options (optional)
+h3(#cfopts). Column Family Options (optional)
 
 bc(sample). 
 CREATE COLUMNFAMILY ... WITH keyword1 = arg1 AND keyword2 = arg2;
@@ -538,17 +543,14 @@ A number of optional keyword arguments can be supplied to control the configurat
 |_. keyword|_. default|_. description|
 |comparator|text|Determines the storage type of column names (which itself determines the sorting and validation of column names). Valid values are listed in the "Data Storage Types":#storageTypes table above.|
 |comment|none|A free-form, human-readable comment.|
-|row_cache_provider|SerializingCacheProvider if JNA is present, otherwise ConcurrentHashMapCacheProvider|A factory for the cache with which to back the row cache.|
-|row_cache_size|0|Number of rows whose entire contents to cache in memory.|
-|key_cache_size|200000|Number of keys per SSTable whose locations are kept in memory in "mostly LRU" order.|
 |read_repair_chance|1.0|The probability with which read repairs should be invoked on non-quorum reads.|
 |gc_grace_seconds|864000|Time to wait before garbage collecting tombstones (deletion markers).|
 |default_validation|text|Determines the default storage type of column values (which itself determines the validation for column values). This option does not affect the types of columns which were defined in a @CREATE COLUMNFAMILY@ statement-- only new columns. Valid values are listed in the "Data Storage Types":#storageTypes table above.|
 |min_compaction_threshold|4|Minimum number of SSTables needed to start a minor compaction.|
 |max_compaction_threshold|32|Maximum number of SSTables allowed before a minor compaction is forced.|
-|row_cache_save_period_in_seconds|0|Number of seconds between saving row caches.|
-|key_cache_save_period_in_seconds|14400|Number of seconds between saving key caches.|
 |replicate_on_write|false| |
+|compaction_strategy_options|none|CompactionStrategy specific options such as "sstable_size_in_mb" for LeveledCompactionStrategy and "min_sstable_size" for SizeTieredCompactionStrategy|
+|compression_parameters|none|Compression parameters such as "sstable_compressor" and "chunk_length_kb"|
 
 h2. CREATE INDEX
 
@@ -619,11 +621,13 @@ bc(syntax).
 <alterInstructions> ::= "ALTER" <name> "TYPE" <storageType>
                       | "ADD" <name> <storageType>
                       | "DROP" <name>
+                      | "WITH" <optionName> "=" <cfOptionVal>
+                               ( "AND" <optionName> "=" <cfOptionVal> )*
                       ;
 
-An @ALTER@ statement is used to manipulate column family column metadata. It allows you to add new columns, drop existing columns, or change the data storage type of existing columns. No results are returned.
+An @ALTER@ statement is used to manipulate column family column metadata. It allows you to add new columns, drop existing columns, data storage type of existing columns, or change the column family properties. No results are returned.
 
-Specify the name of the column family to be changed after the @ALTER COLUMNFAMILY@ keywords, and the name of the column to be changed, added, or dropped after the keyword corresponding to the type of change desired (@ALTER@, @ADD@, @DROP@).
+Specify the name of the column family to be changed after the @ALTER COLUMNFAMILY@ keywords, followed by the type of change desired (@ALTER@, @ADD@, @DROP@, or @WITH@), and provide the rest of the needed information, as explained below.
 
 h3. Changing the type of a typed column
 
@@ -645,6 +649,15 @@ bc(sample).
 ALTER COLUMNFAMILY addamsFamily DROP gender;
 
 An @ALTER COLUMNFAMILY ... DROP@ statement removes the type of a column from the column family metadata. Note that this does _not_ remove the column from current rows; it just removes the metadata saying that the bytes stored under that column are expected to be deserializable according to a certain type.
+
+h3. Modifying column family properties
+
+bc(sample). 
+ALTER COLUMNFAMILY addamsFamily WITH comment = 'A most excellent and useful column family' AND read_repair_chance = 0.2;
+
+An @ALTER COLUMNFAMILY ... WITH@ statement makes adjustments to the column family properties, as defined when the column family was created (see "CREATE COLUMNFAMILY options":#cfopts for information about the supported options and values).
+
+Note that setting any @compaction_strategy_options:*@ parameters has the effect of erasing all previous @compaction_strategy_options:*@ parameters, so you will need to re-specify any such parameters which have already been set, if you want to keep them. The same note applies to the set of @compression_parameters:*@ parameters.
 
 h2. Common Idioms
 

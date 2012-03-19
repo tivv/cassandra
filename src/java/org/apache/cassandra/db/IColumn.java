@@ -33,9 +33,15 @@ public interface IColumn
 {
     public static final int MAX_NAME_LENGTH = FBUtilities.MAX_UNSIGNED_SHORT;
 
+    /**
+     * @return true if the column has been deleted (is a tombstone).  This depends on comparing the server clock
+     * with getLocalDeletionTime, so it can change during a single request if you're not careful.
+     */
     public boolean isMarkedForDelete();
+
     public long getMarkedForDeleteAt();
     public long mostRecentLiveChangeAt();
+    public long mostRecentNonGCableChangeAt(int gcbefore);
     public ByteBuffer name();
     public int size();
     public int serializedSize();
@@ -51,7 +57,7 @@ public interface IColumn
     public IColumn reconcile(IColumn column, Allocator allocator);
     public void updateDigest(MessageDigest digest);
     public int getLocalDeletionTime(); // for tombstone GC, so int is sufficient granularity
-    public String getString(AbstractType comparator);
+    public String getString(AbstractType<?> comparator);
     public void validateFields(CFMetaData metadata) throws MarshalException;
 
     /** clones the column for the row cache, interning column names and making copies of other underlying byte buffers */

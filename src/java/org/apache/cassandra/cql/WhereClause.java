@@ -20,16 +20,15 @@ package org.apache.cassandra.cql;
  * 
  */
 
-
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.utils.ByteBufferUtil;
-
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
  * WhereClauses encapsulate all of the predicates of a SELECT query.
@@ -37,10 +36,14 @@ import java.util.Set;
  */
 public class WhereClause
 {
-    // added to either by the parser, e.g. from an IN clause, or by extractKeysFromColumns
+    // all relations (except for `<key> IN (.., .., ..)` which can be directly interpreted) from parser
+    // are stored into this array and are filtered to the keys/columns by extractKeysFromColumns(...)
+    private List<Relation> clauseRelations = new ArrayList<Relation>();
+    private List<Relation> columns = new ArrayList<Relation>();
+
+    // added to either by the parser from an IN clause or by extractKeysFromColumns
     private Set<Term> keys = new LinkedHashSet<Term>();
     private Term startKey, finishKey;
-    private List<Relation> columns = new ArrayList<Relation>();
     private boolean includeStartKey = false, includeFinishKey = false, multiKey = false;
     // set by extractKeysFromColumns
     private String keyAlias = null;
@@ -56,9 +59,7 @@ public class WhereClause
     }
     
     public WhereClause()
-    {
-        
-    }
+    {}
     
     /**
      * Add an additional relation to this WHERE clause.
@@ -67,24 +68,7 @@ public class WhereClause
      */
     public void and(Relation relation)
     {
-        if ((relation != null) && relation.isKey())
-        {
-            if (relation.operator() == RelationType.EQ)
-                keys.add(relation.getValue());
-            else if ((relation.operator() == RelationType.GT) || (relation.operator() == RelationType.GTE))
-            {
-                startKey = relation.getValue();
-                includeStartKey = relation.operator() == RelationType.GTE;
-            }
-            else if ((relation.operator() == RelationType.LT) || (relation.operator() == RelationType.LTE))
-            {
-                finishKey = relation.getValue();
-                includeFinishKey = relation.operator() == RelationType.LTE;
-            }
-            
-        }
-        else
-            columns.add(relation);
+        clauseRelations.add(relation);
     }
 
     /**
@@ -159,26 +143,46 @@ public class WhereClause
 
     public void extractKeysFromColumns(CFMetaData cfm)
     {
-        ByteBuffer realKeyAlias = cfm.getKeyName();
+        String realKeyAlias = null;
+        try
+        {
+            // ThriftValidation ensures that key_alias is ascii
+            realKeyAlias = ByteBufferUtil.string(cfm.getKeyName()).toUpperCase();
+        }
+        catch (CharacterCodingException e)
+        {
+            throw new RuntimeException(e);
+        }
 
         if (!keys.isEmpty())
-            return; // we already have key(s) set
+            return; // we already have key(s) set (<key> IN (.., ...) construction used)
 
-        Iterator<Relation> iter = columns.iterator();
-
-        while (iter.hasNext())
+        for (Relation relation : clauseRelations)
         {
-            Relation relation = iter.next();
-
-            ByteBuffer name = ByteBufferUtil.bytes(relation.getEntity().getText());
-
+            String name = relation.getEntity().getText().toUpperCase();
             if (name.equals(realKeyAlias))
             {
-                // setting found key as an alias
-                keyAlias = relation.getEntity().getText().toUpperCase();
-                keys.add(relation.getValue()); // add a key value to the keys list
-                iter.remove(); // removing it from the columns
-                break;
+                if (keyAlias == null) // setting found key as an alias
+                    keyAlias = name;
+
+                if (relation.operator() == RelationType.EQ)
+                {
+                    keys.add(relation.getValue());
+                }
+                else if ((relation.operator() == RelationType.GT) || (relation.operator() == RelationType.GTE))
+                {
+                    startKey = relation.getValue();
+                    includeStartKey = relation.operator() == RelationType.GTE;
+                }
+                else if ((relation.operator() == RelationType.LT) || (relation.operator() == RelationType.LTE))
+                {
+                    finishKey = relation.getValue();
+                    includeFinishKey = relation.operator() == RelationType.LTE;
+                }
+            }
+            else
+            {
+                columns.add(relation);
             }
         }
     }
@@ -195,6 +199,4 @@ public class WhereClause
                              multiKey,
                              keyAlias);
     }
-    
-
 }

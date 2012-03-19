@@ -26,6 +26,9 @@ import java.security.MessageDigest;
 import java.util.Collection;
 import java.util.Comparator;
 
+import com.google.common.base.Objects;
+import com.google.common.collect.Iterables;
+
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.MarshalException;
@@ -40,7 +43,7 @@ import org.cliffc.high_scale_lib.NonBlockingHashMap;
 public class SuperColumn extends AbstractColumnContainer implements IColumn
 {
     private static NonBlockingHashMap<Comparator, SuperColumnSerializer> serializers = new NonBlockingHashMap<Comparator, SuperColumnSerializer>();
-    public static SuperColumnSerializer serializer(AbstractType comparator)
+    public static SuperColumnSerializer serializer(AbstractType<?> comparator)
     {
         SuperColumnSerializer serializer = serializers.get(comparator);
         if (serializer == null)
@@ -53,9 +56,9 @@ public class SuperColumn extends AbstractColumnContainer implements IColumn
 
     private ByteBuffer name;
 
-    public SuperColumn(ByteBuffer name, AbstractType comparator)
+    public SuperColumn(ByteBuffer name, AbstractType<?> comparator)
     {
-        this(name, ThreadSafeSortedColumns.factory().create(comparator, false));
+        this(name, AtomicSortedColumns.factory().create(comparator, false));
     }
 
     SuperColumn(ByteBuffer name, ISortedColumns columns)
@@ -69,16 +72,14 @@ public class SuperColumn extends AbstractColumnContainer implements IColumn
     public SuperColumn cloneMeShallow()
     {
         SuperColumn sc = new SuperColumn(name, getComparator());
-        // since deletion info is immutable, aliasing it is fine
-        sc.deletionInfo.set(deletionInfo.get());
+        sc.delete(this);
         return sc;
     }
 
     public IColumn cloneMe()
     {
         SuperColumn sc = new SuperColumn(name, columns.cloneMe());
-        // since deletion info is immutable, aliasing it is fine
-        sc.deletionInfo.set(deletionInfo.get());
+        sc.delete(this);
         return sc;
     }
 
@@ -144,6 +145,19 @@ public class SuperColumn extends AbstractColumnContainer implements IColumn
         for (IColumn column : getSubColumns())
         {
             if (!column.isMarkedForDelete() && column.timestamp() > max)
+            {
+                max = column.timestamp();
+            }
+        }
+        return max;
+    }
+
+    public long mostRecentNonGCableChangeAt(int gcbefore)
+    {
+        long max = Long.MIN_VALUE;
+        for (IColumn column : getSubColumns())
+        {
+            if (column.getLocalDeletionTime() >= gcbefore && column.timestamp() > max)
             {
                 max = column.timestamp();
             }
@@ -230,7 +244,7 @@ public class SuperColumn extends AbstractColumnContainer implements IColumn
         }
     }
 
-    public String getString(AbstractType comparator)
+    public String getString(AbstractType<?> comparator)
     {
     	StringBuilder sb = new StringBuilder();
         sb.append("SuperColumn(");
@@ -262,8 +276,7 @@ public class SuperColumn extends AbstractColumnContainer implements IColumn
         // we don't try to intern supercolumn names, because if we're using Cassandra correctly it's almost
         // certainly just going to pollute our interning map with unique, dynamic values
         SuperColumn sc = new SuperColumn(allocator.clone(name), this.getComparator());
-        // since deletion info is immutable, aliasing it is fine
-        sc.deletionInfo.set(deletionInfo.get());
+        sc.delete(this);
 
         for(IColumn c : columns)
         {
@@ -296,18 +309,43 @@ public class SuperColumn extends AbstractColumnContainer implements IColumn
             column.validateFields(metadata);
         }
     }
+
+    @Override
+    public boolean equals(Object o)
+    {
+        if (this == o)
+            return true;
+        if (o == null || getClass() != o.getClass())
+            return false;
+
+        SuperColumn sc = (SuperColumn)o;
+
+        if (!name.equals(sc.name))
+            return false;
+        if (getMarkedForDeleteAt() != sc.getMarkedForDeleteAt())
+            return false;
+        if (getLocalDeletionTime() != sc.getLocalDeletionTime())
+            return false;
+        return Iterables.elementsEqual(columns, sc.columns);
+    }
+
+    @Override
+    public int hashCode()
+    {
+        return Objects.hashCode(name, getMarkedForDeleteAt(), getLocalDeletionTime(), columns);
+    }
 }
 
 class SuperColumnSerializer implements IColumnSerializer
 {
-    private AbstractType comparator;
+    private AbstractType<?> comparator;
 
-    public SuperColumnSerializer(AbstractType comparator)
+    public SuperColumnSerializer(AbstractType<?> comparator)
     {
         this.comparator = comparator;
     }
 
-    public AbstractType getComparator()
+    public AbstractType<?> getComparator()
     {
         return comparator;
     }
@@ -358,7 +396,7 @@ class SuperColumnSerializer implements IColumnSerializer
         int size = dis.readInt();
         ColumnSerializer serializer = Column.serializer();
         ColumnSortedMap preSortedMap = new ColumnSortedMap(comparator, serializer, dis, size, flag, expireBefore);
-        SuperColumn superColumn = new SuperColumn(name, ThreadSafeSortedColumns.factory().fromSorted(preSortedMap, false));
+        SuperColumn superColumn = new SuperColumn(name, AtomicSortedColumns.factory().fromSorted(preSortedMap, false));
         superColumn.delete(localDeleteTime, markedForDeleteAt);
         return superColumn;
     }

@@ -26,7 +26,11 @@ import java.util.List;
 
 import org.apache.cassandra.db.RowPosition;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.Pair;
 
+/**
+ * AbstractBounds containing both its endpoints: [left, right].  Used by "classic" by-key range scans.
+ */
 public class Bounds<T extends RingPosition> extends AbstractBounds<T>
 {
     public Bounds(T left, T right)
@@ -46,9 +50,16 @@ public class Bounds<T extends RingPosition> extends AbstractBounds<T>
         return Range.contains(left, right, position) || left.equals(position);
     }
 
-    public AbstractBounds<T> createFrom(T position)
+    public Pair<AbstractBounds<T>, AbstractBounds<T>> split(T position)
     {
-        return new Bounds<T>(left, position, partitioner);
+        assert contains(position);
+        // Check if the split would have no effect on the range
+        if (position.equals(right))
+            return null;
+
+        AbstractBounds<T> lb = new Bounds<T>(left, position, partitioner);
+        AbstractBounds<T> rb = new Range<T>(position, right, partitioner);
+        return new Pair<AbstractBounds<T>, AbstractBounds<T>>(lb, rb);
     }
 
     public List<? extends AbstractBounds<T>> unwrap()
